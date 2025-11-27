@@ -18,7 +18,15 @@ def extract_prices_from_pdf(pdf_file):
     - PRICE_INCL (Price-A Incl, 5th decimal number on the line)
     """
     items = []
-    code_pattern = re.compile(r"^(\d+[A-Za-z]?)\b") # e.g. 8610100002, 8610100041G
+    # This regex now looks for a code, then description (can be multi-line),
+    # then a series of numbers, and captures the 5th one as price.
+    # It's more flexible with whitespace and newlines.
+    product_pattern = re.compile(
+        r"(\d+[A-Za-z]?)\s*\n"  # CODE (e.g., 8613900035) followed by newline
+        r"(.+?)\s*\n"          # DESCRIPTION (non-greedy, multi-line) followed by newline
+        r"(?:\s*\d+\.\d+\s*\n){4}" # Four lines of numbers (non-capturing group)
+        r"\s*(\d+\.\d+)"       # The 5th number, which is PRICE_INCL
+    )
 
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
@@ -26,29 +34,11 @@ def extract_prices_from_pdf(pdf_file):
             if not text:
                 continue
 
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-
-                if not code_pattern.match(line):
-                    continue
-
-                parts = line.split()
-                code = parts[0]
-
-                numbers = [p for p in parts if re.match(r"^\d+\.\d+$", p)]
-                if len(numbers) < 5:
-                    continue
-
-                price_incl = float(numbers[4])
-
-                desc_tokens = []
-                for p in parts[1:]:
-                    if re.match(r"^\d+\.\d+$", p):
-                        break
-                    desc_tokens.append(p)
-                description = " ".join(desc_tokens)
+            # Search for all product patterns in the entire page text
+            for match in product_pattern.finditer(text):
+                code = match.group(1).strip()
+                description = match.group(2).strip()
+                price_incl = float(match.group(3).strip())
 
                 # base code = digits-only from start of CODE
                 m = re.match(r"^(\d+)", code)
