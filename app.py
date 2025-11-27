@@ -233,13 +233,14 @@ def build_excel_with_thumbnails(df, photos):
 
 
 # -----------------------------------------
-# STEP 4 — 3x3 PDF Catalogue (no barcode)
+# STEP 4 — 3x3 PDF Catalogue (with code number)
 # -----------------------------------------
 def build_pdf_catalog(df, photos):
     """
     3x3 grid per page:
     - Big image
     - Price
+    - Code (barcode number)
     - Description
     - Page number at bottom
     """
@@ -263,6 +264,7 @@ def build_pdf_catalog(df, photos):
     cell_w = usable_w / cols
     cell_h = usable_h / rows
 
+    # A: keep current reasonable image max size
     img_max_w = cell_w - 20
     img_max_h = cell_h * 0.55
 
@@ -271,6 +273,7 @@ def build_pdf_catalog(df, photos):
     for idx, (_, row) in enumerate(df.iterrows()):
         pos = idx % items_per_page
 
+        # New page after 9 items
         if pos == 0 and idx != 0:
             c.setFont("Helvetica", 9)
             c.drawCentredString(page_w / 2, margin_bottom / 2,
@@ -286,6 +289,7 @@ def build_pdf_catalog(df, photos):
         filename = row["FILENAME"]
         desc = str(row["DESCRIPTION"]) if not pd.isna(row["DESCRIPTION"]) else ""
         price = row["PRICE_INCL"]
+        code_val = str(row["CODE"]) if not pd.isna(row["CODE"]) else ""
 
         if isinstance(price, (int, float)) and not pd.isna(price):
             price_str = f"R{price:,.2f}"
@@ -313,15 +317,23 @@ def build_pdf_catalog(df, photos):
             except Exception as e:
                 print("Image error:", e)
 
+        # Text area under or around the image
         text_y = y0 + cell_h - img_height_used - 20
 
+        # Price
         c.setFont("Helvetica", 9)
         c.drawString(x0 + 10, text_y, f"Price: {price_str}")
 
+        # Code (barcode number)
+        c.setFont("Helvetica", 9)
+        c.drawString(x0 + 10, text_y - 14, f"Code: {code_val}")
+
+        # Description
         c.setFont("Helvetica", 8)
         desc_line = desc[:80]
-        c.drawString(x0 + 10, text_y - 14, desc_line)
+        c.drawString(x0 + 10, text_y - 28, desc_line)
 
+    # Final page number
     c.setFont("Helvetica", 9)
     c.drawCentredString(page_w / 2, margin_bottom / 2,
                         f"Page {c.getPageNumber()}")
