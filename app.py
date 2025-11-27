@@ -182,14 +182,21 @@ def build_excel_with_thumbnails(df: pd.DataFrame, photo_folder: str) -> BytesIO:
             ws.cell(row=row_idx, column=4, value=float(price))
 
         img_path = os.path.join(photo_folder, row["PHOTO"])
-        try:
-            xl_img = XLImage(img_path)
-            xl_img.width = 130
-            xl_img.height = 130
-            ws.add_image(xl_img, f"A{row_idx}")
-            ws.row_dimensions[row_idx].height = 110
-        except Exception as e:
-            print("Excel image error:", e)
+        ext = os.path.splitext(img_path)[1].lower()
+
+        # Only try to embed supported image types
+        if ext in [".jpg", ".jpeg", ".png"] and os.path.exists(img_path):
+            try:
+                xl_img = XLImage(img_path)
+                xl_img.width = 130
+                xl_img.height = 130
+                ws.add_image(xl_img, f"A{row_idx}")
+                ws.row_dimensions[row_idx].height = 110
+            except Exception as e:
+                print("Excel image error:", e)
+        else:
+            # Unsupported image (e.g. .mpo) – skip thumbnail, avoid crash
+            print("Skipping unsupported image in Excel:", img_path)
 
         row_idx += 1
 
@@ -257,10 +264,11 @@ def generate_pdf_layout(df: pd.DataFrame, photo_folder: str, layout: str) -> byt
                 price_str = "R0.00" if desc or code_val else ""
 
             # Image centered in the cell
-            try:
-                pdf.image(img_path, x=x + (cell_w - img_w) / 2, y=y, w=img_w)
-            except Exception as e:
-                print("PDF image error:", e)
+            if os.path.exists(img_path):
+                try:
+                    pdf.image(img_path, x=x + (cell_w - img_w) / 2, y=y, w=img_w)
+                except Exception as e:
+                    print("PDF image error:", e)
 
             text_y = y + img_h + 4
 
@@ -289,7 +297,7 @@ price_pdf = st.file_uploader("Price PDF", type=["pdf"])
 st.header("2️⃣ Upload Product Photos")
 photos = st.file_uploader(
     "Product photos (filenames must contain the code)",
-    type=["jpg", "jpeg", "png"],
+    type=["jpg", "jpeg", "png", "mpo", "MPO"],
     accept_multiple_files=True,
 )
 
