@@ -41,71 +41,115 @@ def extract_photo_norm_code(filename: str) -> str:
 
 
 # ---------------------------------------------------------
-# PDF price extraction (fast, no OCR)
+# PDF price extraction (block-based, no OCR)
 # ---------------------------------------------------------
 @st.cache_data
 def extract_prices_from_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     """
     Extract CODE, DESCRIPTION, PRICE_INCL from 'PRODUCT DETAILS - BY CODE.pdf'.
 
-    Logic:
-      - Each product row starts with a code: 8613900012 or 8613900012N
-      - There are at least 5 decimal numbers in the line
-      - The 5th decimal number (index 4) is PRICE-A INCL
-      - DESCRIPTION is text between the code and the first number
+    Your sample block:
+
+        8613900033
+        FIMO BEAD STRING 3mm
+         4.22
+         4.22
+         4.85
+         12.61
+         14.50 T
+        N
+         1.00
+         43.00
+         0.00
+         0.00 Y
+        N
+
+    Rules used:
+      - First line of a block = CODE (digits, maybe with trailing letter)
+      - Second (and possibly more) text lines = DESCRIPTION
+      - PRICE-A INCL = the decimal number immediately followed by ' T'
+           e.g. "14.50 T"  -> 14.50
     """
     items = {}
-    code_pattern = re.compile(r"^(\d+[A-Za-z]?)\b")  # e.g. 8613900012 or 8613900012N
+    current_block = []
 
+    def flush_block(block_lines):
+        """Process one product block into items dict."""
+        if not block_lines:
+            return
+
+        # 1) CODE line = first line, must start with digits
+        first = block_lines[0].strip()
+        if not re.match(r"^\d+[A-Za-z]?$", first):
+            return
+
+        code_raw = first
+        norm_code = normalize_code(code_raw)
+        if not norm_code:
+            return
+
+        # Avoid duplicates (keep first occurrence)
+        if norm_code in items:
+            return
+
+        # 2) DESCRIPTION = consecutive non-numeric lines after code,
+        #    until we hit a purely numeric/flag line
+        desc_lines = []
+        for line in block_lines[1:]:
+            s = line.strip()
+            if not s:
+                continue
+            # numeric or price-like / flags => stop description
+            if re.match(r"^[0-9]+\.[0-9]+(\s+[A-Z])?$", s) or re.match(r"^[0-9]+\s*$", s) or s in ("T", "N", "Y"):
+                break
+            desc_lines.append(s)
+
+        description = " ".join(desc_lines)
+
+        # 3) PRICE_INCL = first decimal number followed by ' T'
+        price_incl = None
+        for line in block_lines:
+            s = line.strip()
+            m = re.search(r"(\d+\.\d+)\s+T\b", s)
+            if m:
+                try:
+                    price_incl = float(m.group(1))
+                    break
+                except ValueError:
+                    continue
+
+        # If no price, we still keep code + description
+        items[norm_code] = {
+            "CODE": code_raw,
+            "NORM_CODE": norm_code,
+            "DESCRIPTION": description,
+            "PRICE_INCL": price_incl,
+        }
+
+    # --- Read PDF and split into logical blocks ---
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
             if not text:
                 continue
 
-            for raw_line in text.split("\n"):
-                line = raw_line.strip()
-                if not line:
-                    continue
+            lines = text.split("\n")
+            for raw_line in lines:
+                line = raw_line.rstrip("\n")
+                stripped = line.strip()
 
-                m = code_pattern.match(line)
-                if not m:
-                    continue
+                # Start of a new block = line beginning with a long code
+                if re.match(r"^\d{6,}[A-Za-z]?$", stripped):
+                    # flush previous block
+                    flush_block(current_block)
+                    current_block = [stripped]
+                else:
+                    # continue current block
+                    if current_block:
+                        current_block.append(line)
 
-                code_raw = m.group(1)
-                norm_code = normalize_code(code_raw)
-
-                # Skip duplicates (keep first occurrence)
-                if norm_code in items:
-                    continue
-
-                # Find all decimal numbers
-                numbers = re.findall(r"\d+\.\d+", line)
-                if len(numbers) < 5:
-                    continue
-
-                # 5th decimal = PRICE-A INCL
-                try:
-                    price_incl = float(numbers[4])
-                except ValueError:
-                    continue
-
-                # DESCRIPTION = between CODE and first number
-                parts = line.split()
-                desc_tokens = []
-                for p in parts[1:]:
-                    if re.match(r"\d+\.\d+", p):
-                        break
-                    desc_tokens.append(p)
-
-                description = " ".join(desc_tokens)
-
-                items[norm_code] = {
-                    "CODE": code_raw,
-                    "NORM_CODE": norm_code,
-                    "DESCRIPTION": description,
-                    "PRICE_INCL": price_incl,
-                }
+    # Flush last block
+    flush_block(current_block)
 
     df = pd.DataFrame(items.values())
     return df
