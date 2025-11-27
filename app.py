@@ -233,15 +233,15 @@ def build_excel_with_thumbnails(df, photos):
 
 
 # -----------------------------------------
-# STEP 4 — 3x3 PDF Catalogue (with code number)
+# STEP 4 — 3x3 PDF Catalogue (Price, Description, Code)
 # -----------------------------------------
 def build_pdf_catalog(df, photos):
     """
     3x3 grid per page:
     - Big image
-    - Price
-    - Code (barcode number)
+    - Price (Rxx.xx)
     - Description
+    - Code (barcode number) as LAST LINE
     - Page number at bottom
     """
     file_dict = {f.name: f for f in photos}
@@ -264,7 +264,6 @@ def build_pdf_catalog(df, photos):
     cell_w = usable_w / cols
     cell_h = usable_h / rows
 
-    # A: keep current reasonable image max size
     img_max_w = cell_w - 20
     img_max_h = cell_h * 0.55
 
@@ -273,7 +272,6 @@ def build_pdf_catalog(df, photos):
     for idx, (_, row) in enumerate(df.iterrows()):
         pos = idx % items_per_page
 
-        # New page after 9 items
         if pos == 0 and idx != 0:
             c.setFont("Helvetica", 9)
             c.drawCentredString(page_w / 2, margin_bottom / 2,
@@ -292,7 +290,7 @@ def build_pdf_catalog(df, photos):
         code_val = str(row["CODE"]) if not pd.isna(row["CODE"]) else ""
 
         if isinstance(price, (int, float)) and not pd.isna(price):
-            price_str = f"R{price:,.2f}"
+            price_str = f"R{price:,.2f}"   # format "R42.50" – no space
         else:
             price_str = ""
 
@@ -317,23 +315,22 @@ def build_pdf_catalog(df, photos):
             except Exception as e:
                 print("Image error:", e)
 
-        # Text area under or around the image
+        # Text under the image
         text_y = y0 + cell_h - img_height_used - 20
 
-        # Price
+        # Price line
         c.setFont("Helvetica", 9)
         c.drawString(x0 + 10, text_y, f"Price: {price_str}")
 
-        # Code (barcode number)
-        c.setFont("Helvetica", 9)
-        c.drawString(x0 + 10, text_y - 14, f"Code: {code_val}")
-
-        # Description
+        # Description line
         c.setFont("Helvetica", 8)
         desc_line = desc[:80]
-        c.drawString(x0 + 10, text_y - 28, desc_line)
+        c.drawString(x0 + 10, text_y - 14, desc_line)
 
-    # Final page number
+        # Code line (barcode number) as last line
+        c.setFont("Helvetica", 9)
+        c.drawString(x0 + 10, text_y - 28, f"Code: {code_val}")
+
     c.setFont("Helvetica", 9)
     c.drawCentredString(page_w / 2, margin_bottom / 2,
                         f"Page {c.getPageNumber()}")
@@ -346,7 +343,7 @@ def build_pdf_catalog(df, photos):
 # -----------------------------------------
 # STREAMLIT UI
 # -----------------------------------------
-st.header("1️⃣ Upload Price PDF")
+st.header(1️⃣ Upload Price PDF")
 price_pdf = st.file_uploader("Upload price PDF", type=["pdf"])
 
 st.header("2️⃣ Upload Product Photos")
