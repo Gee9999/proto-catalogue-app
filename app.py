@@ -9,6 +9,11 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from fpdf import FPDF
 import tempfile
+import mimetypes
+
+# --- SAFETY PATCH: make sure .mpo won't ever break openpyxl ---
+mimetypes.add_type("image/jpeg", ".mpo", strict=True)
+mimetypes.add_type("image/jpeg", ".MPO", strict=True)
 
 st.set_page_config(page_title="Proto Catalogue (PDF only)", layout="wide")
 st.title("📸 Proto Trading – Catalogue Builder (3×3 / 4×4, PDF Only)")
@@ -172,6 +177,8 @@ def build_excel_with_thumbnails(df: pd.DataFrame, photo_folder: str) -> BytesIO:
     ws.column_dimensions["E"].width = 30
 
     row_idx = 2
+    skipped_images = []
+
     for _, row in df.iterrows():
         ws.cell(row=row_idx, column=2, value=row["CODE"])
         ws.cell(row=row_idx, column=3, value=row["DESCRIPTION"])
@@ -184,7 +191,7 @@ def build_excel_with_thumbnails(df: pd.DataFrame, photo_folder: str) -> BytesIO:
         img_path = os.path.join(photo_folder, row["PHOTO"])
         ext = os.path.splitext(img_path)[1].lower()
 
-        # Only try to embed supported image types
+        # Only embed JPEG/PNG; skip everything else 100% safely
         if ext in [".jpg", ".jpeg", ".png"] and os.path.exists(img_path):
             try:
                 xl_img = XLImage(img_path)
@@ -194,16 +201,18 @@ def build_excel_with_thumbnails(df: pd.DataFrame, photo_folder: str) -> BytesIO:
                 ws.row_dimensions[row_idx].height = 110
             except Exception as e:
                 print("Excel image error:", e)
+                skipped_images.append(row["PHOTO"])
         else:
-            # Unsupported image (e.g. .mpo) – skip thumbnail, avoid crash
-            print("Skipping unsupported image in Excel:", img_path)
+            skipped_images.append(row["PHOTO"])
 
         row_idx += 1
 
     out = BytesIO()
     wb.save(out)
     out.seek(0)
-    return out
+
+    # Return buffer + list of skipped images for UI feedback
+    return out, skipped_images
 
 
 # ---------------------------------------------------------
@@ -254,6 +263,8 @@ def generate_pdf_layout(df: pd.DataFrame, photo_folder: str, layout: str) -> byt
             y = margin_y + r * cell_h
 
             img_path = os.path.join(photo_folder, row["PHOTO"])
+            ext = os.path.splitext(img_path)[1].lower()
+
             desc = str(row["DESCRIPTION"]) if row["DESCRIPTION"] else ""
             code_val = str(row["CODE"]) if row["CODE"] else ""
             price_val = row["PRICE_INCL"]
@@ -263,8 +274,8 @@ def generate_pdf_layout(df: pd.DataFrame, photo_folder: str, layout: str) -> byt
             else:
                 price_str = "R0.00" if desc or code_val else ""
 
-            # Image centered in the cell
-            if os.path.exists(img_path):
+            # Only draw JPEG/PNG in PDF to avoid weird formats
+            if ext in [".jpg", ".jpeg", ".png"] and os.path.exists(img_path):
                 try:
                     pdf.image(img_path, x=x + (cell_w - img_w) / 2, y=y, w=img_w)
                 except Exception as e:
@@ -297,7 +308,8 @@ price_pdf = st.file_uploader("Price PDF", type=["pdf"])
 st.header("2️⃣ Upload Product Photos")
 photos = st.file_uploader(
     "Product photos (filenames must contain the code)",
-    type=["jpg", "jpeg", "png", "mpo", "MPO"],
+    # IMPORTANT: only allow real image formats here
+    type=["jpg", "jpeg", "png"],
     accept_multiple_files=True,
 )
 
@@ -332,7 +344,14 @@ if st.button("PROCESS"):
         st.dataframe(matched_df)
 
         with st.spinner("Building Excel with thumbnails…"):
-            excel_file = build_excel_with_thumbnails(matched_df, temp_dir)
+            excel_file, skipped = build_excel_with_thumbnails(matched_df, temp_dir)
+
+        if skipped:
+            st.warning(
+                f"Some images were skipped for Excel (unsupported or error): "
+                + ", ".join(skipped[:10])
+                + (" ..." if len(skipped) > 10 else "")
+            )
 
         layout_key = "3x3" if "3×3" in layout_choice else "4x4"
         with st.spinner(f"Building {layout_key} PDF catalogue…"):
