@@ -2,190 +2,299 @@
 import pandas as pd
 import os
 import re
-import fitz            # PyMuPDF
-import pytesseract     # OCR
+import fitz              # PyMuPDF (fast PDF)
+import pytesseract       # OCR fallback
 from PIL import Image
 from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
 from fpdf import FPDF
+import tempfile
 
-# Ensure Tesseract path exists on Windows
+# IMPORTANT: Point to your Tesseract installation
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-st.title("📸 Product Photo + Price Catalogue Generator (OCR Enabled)")
+# Streamlit page
+st.set_page_config(page_title="Proto Catalogue (OCR)", layout="wide")
+st.title("📸 Proto Trading – OCR Catalogue Builder (3×3 / 4×4)")
 
-# -----------------------------
-# EXTRACT TEXT (FAST MODE)
-# -----------------------------
-def extract_text_fast(doc):
-    text = ""
+# ---------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------
+
+def normalize_code(code: str) -> str:
+    """Keep only digits."""
+    return re.sub(r"[^0-9]", "", str(code))
+
+
+def extract_photo_norm_code(filename: str) -> str:
+    """
+    Extract numeric code from photo name:
+    Example: 8613900012-20PCS.jpg → 8613900012
+    """
+    stem = os.path.splitext(filename)[0]
+    base = stem.split("-")[0]
+    return normalize_code(base)
+
+
+# ---------------------------------------------------------
+# Extract prices from PDF (FAST + OCR fallback)
+# ---------------------------------------------------------
+@st.cache_data
+def extract_prices_from_pdf(pdf_bytes: bytes) -> pd.DataFrame:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    code_pattern = re.compile(r"^(\d+[A-Za-z]?)\b")
+
+    items = {}
+
     for page in doc:
+        # first try fast text extraction
+        text = page.get_text("text")
+
+        # if no text → use OCR
+        if not text or len(text.strip()) < 10:
+            pix = page.get_pixmap(dpi=200)
+            img = Image.open(BytesIO(pix.tobytes("png")))
+            text = pytesseract.image_to_string(img)
+
+        if not text:
+            continue
+
+        for raw_line in text.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            m = code_pattern.match(line)
+            if not m:
+                continue
+
+            code_raw = m.group(1)
+            norm = normalize_code(code_raw)
+
+            if norm in items:
+                continue
+
+            # find decimals
+            numbers = re.findall(r"\d+\.\d+", line)
+            if len(numbers) < 5:
+                continue
+
+            price_incl = float(numbers[4])
+
+            parts = line.split()
+            desc_tokens = []
+            for p in parts[1:]:
+                if re.match(r"\d+\.\d+", p):
+                    break
+                desc_tokens.append(p)
+
+            description = " ".join(desc_tokens)
+
+            items[norm] = {
+                "CODE": code_raw,
+                "NORM_CODE": norm,
+                "DESCRIPTION": description,
+                "PRICE_INCL": price_incl,
+            }
+
+    return pd.DataFrame(items.values())
+
+
+# ---------------------------------------------------------
+# Match photos to prices
+# ---------------------------------------------------------
+def match_photos_to_prices(photo_names, price_df):
+    price_map = {str(r["NORM_CODE"]): r for _, r in price_df.iterrows()}
+
+    rows = []
+    for fname in photo_names:
+        norm = extract_photo_norm_code(fname)
+
+        row = price_map.get(norm)
+
+        # fallback: trim last digits
+        if row is None:
+            for trim in range(1, 4):
+                if len(norm) - trim < 4:
+                    break
+                candidate = norm[:-trim]
+                row = price_map.get(candidate)
+                if row:
+                    break
+
+        if row:
+            rows.append({
+                "PHOTO": fname,
+                "CODE": row["CODE"],
+                "DESCRIPTION": row["DESCRIPTION"],
+                "PRICE_INCL": row["PRICE_INCL"],
+                "FILENAME": fname
+            })
+        else:
+            rows.append({
+                "PHOTO": fname,
+                "CODE": norm,
+                "DESCRIPTION": "",
+                "PRICE_INCL": None,
+                "FILENAME": fname
+            })
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------
+# Build Excel with thumbnail images
+# ---------------------------------------------------------
+def build_excel_with_thumbnails(df, photo_folder):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Products"
+
+    ws.append(["Photo", "Code", "Description", "Price incl", "Filename"])
+
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 40
+    ws.column_dimensions["D"].width = 14
+    ws.column_dimensions["E"].width = 30
+
+    row_idx = 2
+    for _, row in df.iterrows():
+        ws.cell(row=row_idx, column=2, value=row["CODE"])
+        ws.cell(row=row_idx, column=3, value=row["DESCRIPTION"])
+        ws.cell(row=row_idx, column=5, value=row["FILENAME"])
+
+        if row["PRICE_INCL"] is not None:
+            ws.cell(row=row_idx, column=4, value=float(row["PRICE_INCL"]))
+
         try:
-            text += page.get_text()
+            img_path = os.path.join(photo_folder, row["PHOTO"])
+            xl_img = XLImage(img_path)
+            xl_img.width = 130
+            xl_img.height = 130
+            ws.add_image(xl_img, f"A{row_idx}")
+            ws.row_dimensions[row_idx].height = 110
         except:
             pass
-    return text
 
-# -----------------------------
-# EXTRACT TEXT WITH OCR (SLOW MODE)
-# -----------------------------
-def extract_text_ocr(doc):
-    text = ""
-    for page_no, page in enumerate(doc, start=1):
-        pix = page.get_pixmap(dpi=200)
-        img = Image.open(BytesIO(pix.tobytes("png")))
-        page_text = pytesseract.image_to_string(img)
-        text += page_text
-    return text
+        row_idx += 1
 
-# -----------------------------
-# PARSE PRICE LINES
-# -----------------------------
-price_regex = re.compile(
-    r"(?P<code>\d{6,12}[A-Za-z]?)\s+(?P<desc>.*?)\s+(?P<price>\d+\.\d{2})"
-)
-
-def extract_prices(text):
-    rows = []
-    for line in text.split("\n"):
-        line = line.strip()
-        m = price_regex.search(line)
-        if m:
-            rows.append([
-                m.group("code"),
-                m.group("desc"),
-                m.group("price")
-            ])
-    return rows
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
 
 
-# -----------------------------
-# MATCH PHOTO → PRICE
-# -----------------------------
-def normalize_code(x):
-    return re.sub(r"[^0-9]", "", x)
-
-def match_photos(photo_files, price_df):
-
-    price_df["NORM"] = price_df["CODE"].apply(normalize_code)
-    rows = []
-
-    for fname in photo_files:
-        name_no_ext = os.path.splitext(fname)[0]
-        clean = normalize_code(name_no_ext)
-
-        match = price_df[price_df["NORM"] == clean]
-
-        if not match.empty:
-            desc = match.iloc[0]["DESCRIPTION"]
-            price = match.iloc[0]["PRICE"]
-        else:
-            desc = ""
-            price = ""
-
-        rows.append([fname, clean, desc, price, fname])
-
-    df = pd.DataFrame(rows, columns=["PHOTO", "CODE", "DESCRIPTION", "PRICE", "FILENAME"])
-    return df
-
-
-# -----------------------------
-# PHOTO → PDF (3×3 GRID)
-# -----------------------------
-def generate_pdf(df, photo_folder):
+# ---------------------------------------------------------
+# Build PDF catalogue (3×3 or 4×4)
+# ---------------------------------------------------------
+def generate_pdf_layout(df, photo_folder, layout):
     pdf = FPDF("P", "mm", "A4")
     pdf.set_auto_page_break(auto=True, margin=10)
 
-    # grid coordinates
-    cols = 3
-    rows = 3
+    if layout == "3x3":
+        cols, rows = 3, 3
+    else:
+        cols, rows = 4, 4
+
+    page_w, page_h = 210, 297
+    margin_x, margin_y = 10, 10
+    usable_w = page_w - 2 * margin_x
+    usable_h = page_h - 2 * margin_y
+
+    cell_w = usable_w / cols
+    cell_h = usable_h / rows
+
     img_w = 60
-    img_h = 60
-    padding_x = 10
-    padding_y = 10
-    text_h = 5
+    img_h = 45
 
-    for i in range(0, len(df), 9):
+    items_per_page = cols * rows
+    for i in range(0, len(df), items_per_page):
         pdf.add_page()
-        chunk = df.iloc[i:i + 9]
+        chunk = df.iloc[i:i + items_per_page]
 
-        for idx, row in chunk.iterrows():
-            grid_i = idx % 9
-            r = grid_i // cols
-            c = grid_i % cols
+        for idx, (_, row) in enumerate(chunk.iterrows()):
+            r = idx // cols
+            c = idx % cols
 
-            x = padding_x + c * (img_w + 10)
-            y = padding_y + r * (img_h + 20)
+            x = margin_x + c * cell_w
+            y = margin_y + r * cell_h
 
             img_path = os.path.join(photo_folder, row["PHOTO"])
+
+            desc = row["DESCRIPTION"]
+            code = row["CODE"]
+            price = row["PRICE_INCL"]
+
+            price_str = f"R{price:.2f}" if price else "R0.00"
+
             try:
-                pdf.image(img_path, x=x, y=y, w=img_w, h=img_h)
+                pdf.image(img_path, x=x + (cell_w - img_w)/2, y=y, w=img_w)
             except:
                 pass
 
-            pdf.set_xy(x, y + img_h + 2)
-            pdf.set_font("Arial", size=10)
-            pdf.multi_cell(img_w, text_h, f"{row['DESCRIPTION']}", 0, "L")
+            text_y = y + img_h + 4
 
-            # BARCODE number under description
-            pdf.set_xy(x, y + img_h + 12)
+            pdf.set_xy(x, text_y)
+            pdf.set_font("Arial", size=8)
+            pdf.multi_cell(cell_w, 4, desc, 0, "L")
+
+            pdf.set_xy(x, text_y + 16)
             pdf.set_font("Arial", size=9)
-            pdf.multi_cell(img_w, text_h, f"Code: {row['CODE']}", 0, "L")
+            pdf.cell(cell_w, 4, f"Price: {price_str}", 0, 2)
 
-            # PRICE
-            pdf.set_xy(x, y + img_h + 20)
-            pdf.set_font("Arial", size=10)
-            pdf.multi_cell(img_w, text_h, f"Price: R{row['PRICE']}", 0, "L")
+            pdf.set_xy(x, text_y + 23)
+            pdf.cell(cell_w, 4, f"Code: {code}", 0, 2)
 
-    output = BytesIO()
-    pdf.output(output)
-    return output.getvalue()
+    out = BytesIO()
+    pdf.output(out)
+    return out.getvalue()
 
 
-# -----------------------------
-# STREAMLIT UI
-# -----------------------------
+# ---------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------
 st.header("1️⃣ Upload Price PDF")
-pdf_file = st.file_uploader("Choose PDF", type=["pdf"])
+pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
 
-st.header("2️⃣ Upload Photos Folder")
-photo_files = st.file_uploader("Upload Photos (multiple allowed)", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+st.header("2️⃣ Upload Photos")
+photos = st.file_uploader("Upload product photos", type=["jpg","jpeg","png"], accept_multiple_files=True)
 
-if pdf_file and photo_files:
-    st.success("Processing… please wait.")
+layout_option = st.radio("Choose PDF Layout:", ["3×3", "4×4"])
 
-    # Load PDF
-    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+if st.button("PROCESS"):
+    if not pdf_file or not photos:
+        st.error("Upload a price PDF and photos first.")
+    else:
+        with st.spinner("Extracting PDF pricing… (OCR fallback applied)"):
+            price_df = extract_prices_from_pdf(pdf_file.read())
 
-    # FAST extraction
-    text = extract_text_fast(doc)
+        with st.spinner("Saving photos and matching…"):
+            temp_dir = tempfile.mkdtemp()
+            names = []
+            for p in photos:
+                names.append(p.name)
+                with open(os.path.join(temp_dir, p.name), "wb") as f:
+                    f.write(p.getvalue())
 
-    # If text is too small, switch to OCR
-    if len(text.strip()) < 500:
-        st.warning("Normal extraction failed → using OCR mode (slower but accurate)…")
-        doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
-        text = extract_text_ocr(doc)
+            result_df = match_photos_to_prices(names, price_df)
 
-    rows = extract_prices(text)
-    price_df = pd.DataFrame(rows, columns=["CODE", "DESCRIPTION", "PRICE"])
+        st.subheader("Matched Data")
+        st.dataframe(result_df)
 
-    # MATCHING
-    photo_names = [p.name for p in photo_files]
-    temp_folder = "uploaded_photos"
-    os.makedirs(temp_folder, exist_ok=True)
+        with st.spinner("Building Excel…"):
+            excel_bytes = build_excel_with_thumbnails(result_df, temp_dir)
 
-    for p in photo_files:
-        with open(os.path.join(temp_folder, p.name), "wb") as f:
-            f.write(p.read())
+        with st.spinner("Building PDF…"):
+            key = "3x3" if "3×3" in layout_option else "4x4"
+            pdf_bytes = generate_pdf_layout(result_df, temp_dir, key)
 
-    result_df = match_photos(photo_names, price_df)
+        st.success("DONE ✔")
 
-    st.header("3️⃣ Download Excel")
-    st.dataframe(result_df)
+        st.download_button("⬇ Download Excel", data=excel_bytes,
+            file_name="catalogue.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    excel_bytes = result_df.to_excel(index=False)
-    st.download_button("⬇ Download Excel", excel_bytes, "catalogue.xlsx")
-
-    st.header("4️⃣ Generate PDF (3×3 Grid)")
-    pdf_bytes = generate_pdf(result_df, temp_folder)
-    st.download_button("⬇ Download PDF", pdf_bytes, "catalogue.pdf", mime="application/pdf")
-
+        st.download_button("⬇ Download PDF Catalogue", data=pdf_bytes,
+            file_name="catalogue.pdf", mime="application/pdf")
