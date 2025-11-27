@@ -1,0 +1,8 @@
+streamlit
+pillow
+pandas
+pdfplumber
+openpyxl
+reportlab
+python-barcode
+pyarrow
