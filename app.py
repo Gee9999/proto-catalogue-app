@@ -1,349 +1,183 @@
 ﻿import streamlit as st
-import pdfplumber
-import re
 import pandas as pd
-from io import BytesIO
-from openpyxl import Workbook
-from openpyxl.drawing.image import Image as XLImage
-from PIL import Image as PILImage
-
-from reportlab.lib.pagesizes import A4
+import fitz  # PyMuPDF for fast PDF text extraction
+import re
+import io
+from PIL import Image
 from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
+import tempfile
 
+st.set_page_config(page_title="Proto Catalogue Builder", layout="wide")
 
-st.title("📸 Product Catalogue Builder (Proto Trading)")
+# -------------------------
+# FAST PRICE EXTRACTION
+# -------------------------
+@st.cache_data
+def extract_prices_fast(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pattern = re.compile(r"^(\d{5,20})\b")  # CODE at line-start
 
+    items = []
+    for page in doc:
+        text = page.get_text()
+        if not text:
+            continue
 
-# -----------------------------------------
-# Helper: normalise codes
-# -----------------------------------------
-def normalize_code(code: str) -> str:
-    """
-    Keep only digits so that:
-    86101000001, 86101000001A, 86101000001-10mm-10pcs
-    all normalise to: 86101000001
-    """
-    return re.sub(r"[^0-9]", "", str(code))
-
-
-def get_wanted_codes_from_photos(photos):
-    """
-    From photo filenames, build a set of base numeric codes we care about.
-    e.g. '86101000001-10mm-10pcs.jpg' -> '86101000001'
-    """
-    wanted = set()
-    for f in photos:
-        filename = f.name
-        # Part before first dash is your base code pattern
-        base_part = filename.split("-")[0]
-        norm = normalize_code(base_part)
-        if norm:
-            wanted.add(norm)
-    return wanted
-
-
-# -----------------------------------------
-# STEP 1 — FASTEST PDF PRICE EXTRACTION
-# -----------------------------------------
-def extract_prices_for_codes(pdf_file, wanted_codes):
-    """
-    Fast mode:
-    - Reads the PDF page by page.
-    - For each line starting with a code, check if the normalised code
-      is one of the wanted_codes (derived from photos).
-    - If yes, extract DESCRIPTION and PRICE-A INCL (5th decimal number).
-    - Returns dict: norm_code -> {CODE, DESCRIPTION, PRICE_INCL}
-    """
-    price_info = {}
-
-    # Read bytes once, then wrap in BytesIO so pdfplumber can reopen it safely
-    pdf_bytes = pdf_file.read()
-    pdf_stream = BytesIO(pdf_bytes)
-
-    code_pattern = re.compile(r"^(\d+[A-Za-z]?)\b")
-
-    with pdfplumber.open(pdf_stream) as pdf:
-        total_pages = len(pdf.pages)
-        progress = st.progress(0, text="Scanning PDF pages for prices...")
-
-        for page_index, page in enumerate(pdf.pages):
-            text = page.extract_text()
-            if not text:
-                # Update progress even if page has no text
-                progress.progress((page_index + 1) / total_pages,
-                                  text=f"Processing page {page_index + 1}/{total_pages}...")
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
                 continue
 
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
+            # detect code
+            m = pattern.match(line)
+            if not m:
+                continue
 
-                # Must start with a code
-                m = code_pattern.match(line)
-                if not m:
-                    continue
+            code = m.group(1)
 
-                orig_code = m.group(1)
-                norm_code = normalize_code(orig_code)
+            # find all decimal numbers
+            nums = re.findall(r"\d+\.\d+", line)
+            if len(nums) < 5:
+                continue
 
-                # Skip lines for codes we don't have photos for
-                if norm_code not in wanted_codes:
-                    continue
+            price_incl = nums[4]  # Price-A INCL (5th number)
 
-                parts = line.split()
+            # extract description (words before the first number)
+            parts = line.split()
+            desc_parts = []
+            for p in parts[1:]:
+                if re.match(r"\d+\.\d+", p):
+                    break
+                desc_parts.append(p)
+            desc = " ".join(desc_parts)
 
-                # All decimal numbers on this row
-                numbers = [p for p in parts if re.match(r"^\d+\.\d+$", p)]
-                # We expect at least 5 decimals; the 5th one is PRICE-A INCL
-                if len(numbers) < 5:
-                    continue
+            items.append([code, desc, price_incl])
 
-                try:
-                    price_incl = float(numbers[4])
-                except ValueError:
-                    continue
+    df = pd.DataFrame(items, columns=["CODE", "DESCRIPTION", "PRICE_INCL"])
+    df = df.drop_duplicates(subset=["CODE"])
 
-                # DESCRIPTION = tokens after code until first decimal number
-                desc_tokens = []
-                for p in parts[1:]:
-                    if re.match(r"^\d+\.\d+$", p):
-                        break
-                    desc_tokens.append(p)
-                description = " ".join(desc_tokens)
-
-                # Only keep the first match for that code
-                if norm_code not in price_info:
-                    price_info[norm_code] = {
-                        "CODE": orig_code,
-                        "DESCRIPTION": description,
-                        "PRICE_INCL": price_incl,
-                    }
-
-            progress.progress((page_index + 1) / total_pages,
-                              text=f"Processing page {page_index + 1}/{total_pages}...")
-
-        progress.empty()
-
-    return price_info
+    return df
 
 
-# -----------------------------------------
-# STEP 2 — Build matched DataFrame (one row per photo)
-# -----------------------------------------
-def build_matched_df_from_price_info(photos, price_info):
-    """
-    For each photo:
-    - Work out its base code (from filename)
-    - Look up that code in price_info
-    - Build a row with: FILENAME, CODE, DESCRIPTION, PRICE_INCL
-    """
+# -------------------------
+# CLEAN CODE from filename
+# -------------------------
+def clean_code_from_filename(fn):
+    # e.g. 86101000001-10mm-10pcs.jpg → 86101000001
+    m = re.match(r"(\d+)", fn)
+    return m.group(1) if m else ""
+
+
+# -------------------------
+# MATCH PHOTOS TO PRICES
+# -------------------------
+def match_photos(photo_files, price_df):
     rows = []
 
-    for f in photos:
-        filename = f.name
-        base_part = filename.split("-")[0]
-        norm_code = normalize_code(base_part)
+    for file in photo_files:
+        fn = file.name
+        base_code = clean_code_from_filename(fn)
 
-        info = price_info.get(norm_code)
+        # variants allowed: -A, -B, 4A, 4B, -4 etc.
+        possible = [
+            base_code,
+            base_code + "A",
+            base_code + "B",
+            base_code + "a",
+            base_code + "b",
+            base_code[:-1],  # sometimes last digit dropped
+        ]
 
-        if info:
-            code_val = info["CODE"]
-            desc = info["DESCRIPTION"]
-            price = info["PRICE_INCL"]
+        found = None
+        for pcode in possible:
+            if pcode in price_df["CODE"].values:
+                found = pcode
+                break
+
+        if found:
+            row = price_df.loc[price_df["CODE"] == found].iloc[0]
+            desc = row["DESCRIPTION"]
+            price = row["PRICE_INCL"]
         else:
-            # No match found in PDF
-            code_val = norm_code
-            desc = "NO MATCH"
+            desc = ""
             price = ""
 
-        rows.append(
-            {
-                "FILENAME": filename,
-                "CODE": code_val,
-                "DESCRIPTION": desc,
-                "PRICE_INCL": price,
-            }
-        )
+        img = Image.open(file).convert("RGB")
+        rows.append([img, base_code, desc, price, fn])
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=["IMAGE", "CODE", "DESCRIPTION", "PRICE_INCL", "FILENAME"])
+    return df
 
 
-# -----------------------------------------
-# STEP 3 — Excel Output with Double Thumbnails
-# -----------------------------------------
-def build_excel_with_thumbnails(df, photos):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Products"
-
-    # Column layout as requested
-    headers = ["Photo", "Code", "Description", "Price incl", "Filename"]
-    ws.append(headers)
-
-    ws.column_dimensions["A"].width = 30
-    ws.column_dimensions["B"].width = 18
-    ws.column_dimensions["C"].width = 40
-    ws.column_dimensions["D"].width = 14
-    ws.column_dimensions["E"].width = 30
-
-    # Map filename -> file object
-    file_dict = {f.name: f for f in photos}
-
-    row_idx = 2
-    for _, row in df.iterrows():
-        filename = row["FILENAME"]
-        code = row["CODE"]
-        desc = row["DESCRIPTION"]
-        price = row["PRICE_INCL"]
-
-        ws.cell(row=row_idx, column=2, value=code)
-        ws.cell(row=row_idx, column=3, value=desc)
-        ws.cell(row=row_idx, column=5, value=filename)
-
-        if price != "" and not pd.isna(price):
-            try:
-                ws.cell(row=row_idx, column=4, value=float(price))
-            except ValueError:
-                pass
-
-        f = file_dict.get(filename)
-        if f:
-            try:
-                pil_img = PILImage.open(BytesIO(f.getvalue()))
-                # Double-size thumbnails
-                pil_img.thumbnail((180, 180))
-                img_buf = BytesIO()
-                pil_img.save(img_buf, format="PNG")
-                img_buf.seek(0)
-
-                xl_img = XLImage(img_buf)
-                ws.add_image(xl_img, f"A{row_idx}")
-                ws.row_dimensions[row_idx].height = 140
-            except Exception as e:
-                print("Image load error:", e)
-
-        row_idx += 1
-
-    out = BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out
-
-
-# -----------------------------------------
-# STEP 4 — 3x3 PDF Catalogue (Price, Description, Code)
-# -----------------------------------------
-def build_pdf_catalog(df, photos):
-    """
-    3x3 grid per page:
-    - Big image
-    - Price (Rxx.xx)
-    - Description
-    - Code (barcode number) as LAST LINE
-    - Page number at bottom
-    """
-    file_dict = {f.name: f for f in photos}
-
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
+# -------------------------
+# BUILD PDF CATALOGUE (3×3)
+# -------------------------
+def build_pdf_catalog(df):
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
     page_w, page_h = A4
-
-    margin_left = 40
-    margin_right = 40
-    margin_top = 50
-    margin_bottom = 50
 
     cols = 3
     rows = 3
+    cell_w = page_w / cols
+    cell_h = page_h / rows
 
-    usable_w = page_w - margin_left - margin_right
-    usable_h = page_h - margin_top - margin_bottom - 30
+    items = df.to_dict("records")
 
-    cell_w = usable_w / cols
-    cell_h = usable_h / rows
+    for idx, row in enumerate(items):
+        col = idx % cols
+        rw = (idx // cols) % rows
 
-    img_max_w = cell_w - 20
-    img_max_h = cell_h * 0.55
-
-    items_per_page = cols * rows
-
-    for idx, (_, row) in enumerate(df.iterrows()):
-        pos = idx % items_per_page
-
-        if pos == 0 and idx != 0:
-            c.setFont("Helvetica", 9)
-            c.drawCentredString(page_w / 2, margin_bottom / 2,
-                                f"Page {c.getPageNumber()}")
+        if idx % 9 == 0 and idx != 0:
             c.showPage()
 
-        col = pos % cols
-        row_idx = pos // cols
+        x0 = col * cell_w
+        y0 = page_h - (rw + 1) * cell_h
 
-        x0 = margin_left + col * cell_w
-        y0 = margin_bottom + (rows - 1 - row_idx) * cell_h
+        pil_img = row["IMAGE"]
+        max_w, max_h = 150, 150
+        pil_img.thumbnail((max_w, max_h))
+        img_w, img_h = pil_img.size
 
-        filename = row["FILENAME"]
-        desc = str(row["DESCRIPTION"]) if not pd.isna(row["DESCRIPTION"]) else ""
-        price = row["PRICE_INCL"]
-        code_val = str(row["CODE"]) if not pd.isna(row["CODE"]) else ""
+        img_x = x0 + (cell_w - img_w) / 2
+        img_y = y0 + cell_h - img_h - 20
 
-        if isinstance(price, (int, float)) and not pd.isna(price):
-            price_str = f"R{price:,.2f}"   # format "R42.50" – no space
-        else:
-            price_str = ""
+        c.drawImage(ImageReader(pil_img), img_x, img_y, width=img_w, height=img_h, preserveAspectRatio=True)
 
-        f = file_dict.get(filename)
-        img_height_used = 0
+        # TEXT
+        price_str = f"R{row['PRICE_INCL']}" if row["PRICE_INCL"] else "N/A"
+        desc = row["DESCRIPTION"] if row["DESCRIPTION"] else ""
+        code = row["CODE"] if row["CODE"] else ""
 
-        if f:
-            try:
-                pil_img = PILImage.open(BytesIO(f.getvalue()))
-                pil_img.thumbnail((img_max_w, img_max_h))
-                img_buf = BytesIO()
-                pil_img.save(img_buf, format="PNG")
-                img_buf.seek(0)
+        text_y = img_y - 16
 
-                iw, ih = pil_img.size
-                img_reader = ImageReader(img_buf)
-                img_x = x0 + (cell_w - iw) / 2
-                img_y = y0 + cell_h - ih - 10
-
-                c.drawImage(img_reader, img_x, img_y, width=iw, height=ih)
-                img_height_used = ih
-            except Exception as e:
-                print("Image error:", e)
-
-        # Text under the image
-        text_y = y0 + cell_h - img_height_used - 20
-
-        # Price line
+        # Price
         c.setFont("Helvetica", 9)
         c.drawString(x0 + 10, text_y, f"Price: {price_str}")
 
-        # Description line
+        # Description
         c.setFont("Helvetica", 8)
-        desc_line = desc[:80]
-        c.drawString(x0 + 10, text_y - 14, desc_line)
+        c.drawString(x0 + 10, text_y - 14, desc[:80])
 
-        # Code line (barcode number) as last line
-        c.setFont("Helvetica", 9)
-        c.drawString(x0 + 10, text_y - 28, f"Code: {code_val}")
+        # Code LAST LINE (Option C)
+        c.setFont("Helvetica", 8)
+        c.drawString(x0 + 10, text_y - 28, f"Code: {code}")
 
-    c.setFont("Helvetica", 9)
-    c.drawCentredString(page_w / 2, margin_bottom / 2,
-                        f"Page {c.getPageNumber()}")
+    c.showPage()
     c.save()
+    buffer.seek(0)
+    return buffer
 
-    buf.seek(0)
-    return buf
 
-
-# -----------------------------------------
+# -------------------------
 # STREAMLIT UI
-# -----------------------------------------
-st.header(1️⃣ Upload Price PDF")
+# -------------------------
+
+st.title("🟥 Proto Trading Catalogue Builder")
+
+st.header("1️⃣ Upload Price PDF")
 price_pdf = st.file_uploader("Upload price PDF", type=["pdf"])
 
 st.header("2️⃣ Upload Product Photos")
@@ -353,53 +187,42 @@ photos = st.file_uploader(
     type=["jpg", "jpeg", "png"],
 )
 
-if st.button("PROCESS"):
-    if not price_pdf or not photos:
-        st.error("Please upload both the price PDF and photos.")
-    else:
-        try:
-            with st.spinner("Reading photo codes..."):
-                wanted_codes = get_wanted_codes_from_photos(photos)
+if price_pdf and photos:
+    st.success("Files uploaded! Extracting prices…")
 
-            if not wanted_codes:
-                st.error("Could not find any valid numeric codes in photo filenames.")
-                st.stop()
+    price_bytes = price_pdf.read()
+    price_df = extract_prices_fast(price_bytes)
 
-            with st.spinner("Extracting prices from big PDF (fast mode)..."):
-                price_info = extract_prices_for_codes(price_pdf, wanted_codes)
+    st.write(f"📘 Extracted **{len(price_df)}** price records.")
 
-            with st.spinner("Matching photos to prices..."):
-                matched_df = build_matched_df_from_price_info(photos, price_info)
+    st.success("Matching photos…")
+    matched_df = match_photos(photos, price_df)
 
-            # Make Streamlit happy with Arrow types
-            matched_df["PRICE_INCL"] = pd.to_numeric(
-                matched_df["PRICE_INCL"], errors="coerce"
-            )
+    st.write(f"🖼 Matched **{matched_df['DESCRIPTION'].count()}** photos with prices")
 
-            with st.spinner("Building Excel with thumbnails..."):
-                excel_file = build_excel_with_thumbnails(matched_df, photos)
+    # Excel thumbnail creation
+    thumb_rows = []
+    for _, r in matched_df.iterrows():
+        img = r["IMAGE"].copy()
+        img.thumbnail((200, 200))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        buf.seek(0)
+        thumb_rows.append([buf.getvalue(), r["CODE"], r["DESCRIPTION"], r["PRICE_INCL"], r["FILENAME"]])
 
-            with st.spinner("Building 3x3 PDF catalogue..."):
-                pdf_file = build_pdf_catalog(matched_df, photos)
+    excel_df = pd.DataFrame(thumb_rows, columns=["THUMBNAIL", "CODE", "DESCRIPTION", "PRICE_INCL", "FILENAME"])
 
-            st.success("Done! Your files are ready.")
+    # Make thumbnail a PNG in Excel
+    output_excel = io.BytesIO()
+    with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
+        excel_df.drop(columns=["THUMBNAIL"]).to_excel(writer, index=False, sheet_name="Data")
 
-            st.download_button(
-                "⬇️ Download Excel",
-                data=excel_file,
-                file_name="product_catalogue.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+    output_excel.seek(0)
 
-            st.download_button(
-                "📄 Download 3x3 PDF Catalogue",
-                data=pdf_file,
-                file_name="product_catalogue.pdf",
-                mime="application/pdf",
-            )
+    # PDF Build
+    st.success("Building PDF Catalogue…")
+    pdf_buffer = build_pdf_catalog(matched_df)
 
-            st.subheader("Preview of matched data")
-            st.dataframe(matched_df)
+    st.download_button("⬇️ Download Excel", data=output_excel, file_name="catalogue.xlsx")
+    st.download_button("⬇️ Download PDF Catalogue", data=pdf_buffer, file_name="catalogue.pdf", mime="application/pdf")
 
-        except Exception as e:
-            st.error(f"Error while processing: {e}")
