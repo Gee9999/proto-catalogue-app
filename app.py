@@ -16,7 +16,7 @@ st.title("📸 Product Catalogue Builder (Proto Trading)")
 
 
 # -----------------------------------------
-# Helpers
+# Helper: normalise codes
 # -----------------------------------------
 def normalize_code(code: str) -> str:
     """
@@ -29,13 +29,14 @@ def normalize_code(code: str) -> str:
 
 def get_wanted_codes_from_photos(photos):
     """
-    From photo filenames, build a set of base codes we care about.
+    From photo filenames, build a set of base numeric codes we care about.
     e.g. '86101000001-10mm-10pcs.jpg' -> '86101000001'
     """
     wanted = set()
     for f in photos:
         filename = f.name
-        base_part = filename.split("-")[0]  # part before first dash
+        # Part before first dash is your base code pattern
+        base_part = filename.split("-")[0]
         norm = normalize_code(base_part)
         if norm:
             wanted.add(norm)
@@ -43,27 +44,35 @@ def get_wanted_codes_from_photos(photos):
 
 
 # -----------------------------------------
-# STEP 1 — Extract ONLY the needed prices from BIG PDF
+# STEP 1 — FASTEST PDF PRICE EXTRACTION
 # -----------------------------------------
 def extract_prices_for_codes(pdf_file, wanted_codes):
     """
     Fast mode:
-    - Scan all pages
-    - For each line starting with a code
-    - If that code matches one of our wanted_codes (normalised),
-      extract DESCRIPTION and PRICE-A INCL (5th decimal number).
-    - Return a dict: norm_code -> {CODE, DESCRIPTION, PRICE_INCL}
+    - Reads the PDF page by page.
+    - For each line starting with a code, check if the normalised code
+      is one of the wanted_codes (derived from photos).
+    - If yes, extract DESCRIPTION and PRICE-A INCL (5th decimal number).
+    - Returns dict: norm_code -> {CODE, DESCRIPTION, PRICE_INCL}
     """
     price_info = {}
 
-    # Code at start of line
+    # Read bytes once, then wrap in BytesIO so pdfplumber can reopen it safely
+    pdf_bytes = pdf_file.read()
+    pdf_stream = BytesIO(pdf_bytes)
+
     code_pattern = re.compile(r"^(\d+[A-Za-z]?)\b")
 
-    with pdfplumber.open(pdf_file) as pdf:
+    with pdfplumber.open(pdf_stream) as pdf:
         total_pages = len(pdf.pages)
+        progress = st.progress(0, text="Scanning PDF pages for prices...")
+
         for page_index, page in enumerate(pdf.pages):
             text = page.extract_text()
             if not text:
+                # Update progress even if page has no text
+                progress.progress((page_index + 1) / total_pages,
+                                  text=f"Processing page {page_index + 1}/{total_pages}...")
                 continue
 
             for line in text.split("\n"):
@@ -71,6 +80,7 @@ def extract_prices_for_codes(pdf_file, wanted_codes):
                 if not line:
                     continue
 
+                # Must start with a code
                 m = code_pattern.match(line)
                 if not m:
                     continue
@@ -90,7 +100,10 @@ def extract_prices_for_codes(pdf_file, wanted_codes):
                 if len(numbers) < 5:
                     continue
 
-                price_incl = float(numbers[4])
+                try:
+                    price_incl = float(numbers[4])
+                except ValueError:
+                    continue
 
                 # DESCRIPTION = tokens after code until first decimal number
                 desc_tokens = []
@@ -100,13 +113,18 @@ def extract_prices_for_codes(pdf_file, wanted_codes):
                     desc_tokens.append(p)
                 description = " ".join(desc_tokens)
 
-                # Only keep the first match we see for that code
+                # Only keep the first match for that code
                 if norm_code not in price_info:
                     price_info[norm_code] = {
                         "CODE": orig_code,
                         "DESCRIPTION": description,
                         "PRICE_INCL": price_incl,
                     }
+
+            progress.progress((page_index + 1) / total_pages,
+                              text=f"Processing page {page_index + 1}/{total_pages}...")
+
+        progress.empty()
 
     return price_info
 
@@ -160,6 +178,7 @@ def build_excel_with_thumbnails(df, photos):
     ws = wb.active
     ws.title = "Products"
 
+    # Column layout as requested
     headers = ["Photo", "Code", "Description", "Price incl", "Filename"]
     ws.append(headers)
 
@@ -169,6 +188,7 @@ def build_excel_with_thumbnails(df, photos):
     ws.column_dimensions["D"].width = 14
     ws.column_dimensions["E"].width = 30
 
+    # Map filename -> file object
     file_dict = {f.name: f for f in photos}
 
     row_idx = 2
@@ -183,7 +203,10 @@ def build_excel_with_thumbnails(df, photos):
         ws.cell(row=row_idx, column=5, value=filename)
 
         if price != "" and not pd.isna(price):
-            ws.cell(row=row_idx, column=4, value=float(price))
+            try:
+                ws.cell(row=row_idx, column=4, value=float(price))
+            except ValueError:
+                pass
 
         f = file_dict.get(filename)
         if f:
@@ -325,41 +348,49 @@ if st.button("PROCESS"):
     if not price_pdf or not photos:
         st.error("Please upload both the price PDF and photos.")
     else:
-        with st.spinner("Reading photo codes..."):
-            wanted_codes = get_wanted_codes_from_photos(photos)
+        try:
+            with st.spinner("Reading photo codes..."):
+                wanted_codes = get_wanted_codes_from_photos(photos)
 
-        with st.spinner("Extracting prices from big PDF (fast mode)..."):
-            price_info = extract_prices_for_codes(price_pdf, wanted_codes)
+            if not wanted_codes:
+                st.error("Could not find any valid numeric codes in photo filenames.")
+                st.stop()
 
-        with st.spinner("Matching photos to prices..."):
-            matched_df = build_matched_df_from_price_info(photos, price_info)
+            with st.spinner("Extracting prices from big PDF (fast mode)..."):
+                price_info = extract_prices_for_codes(price_pdf, wanted_codes)
 
-        # Make Streamlit happy with Arrow types
-        matched_df["PRICE_INCL"] = pd.to_numeric(
-            matched_df["PRICE_INCL"], errors="coerce"
-        )
+            with st.spinner("Matching photos to prices..."):
+                matched_df = build_matched_df_from_price_info(photos, price_info)
 
-        with st.spinner("Building Excel with thumbnails..."):
-            excel_file = build_excel_with_thumbnails(matched_df, photos)
+            # Make Streamlit happy with Arrow types
+            matched_df["PRICE_INCL"] = pd.to_numeric(
+                matched_df["PRICE_INCL"], errors="coerce"
+            )
 
-        with st.spinner("Building 3x3 PDF catalogue..."):
-            pdf_file = build_pdf_catalog(matched_df, photos)
+            with st.spinner("Building Excel with thumbnails..."):
+                excel_file = build_excel_with_thumbnails(matched_df, photos)
 
-        st.success("Done! Your files are ready.")
+            with st.spinner("Building 3x3 PDF catalogue..."):
+                pdf_file = build_pdf_catalog(matched_df, photos)
 
-        st.download_button(
-            "⬇️ Download Excel",
-            data=excel_file,
-            file_name="product_catalogue.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+            st.success("Done! Your files are ready.")
 
-        st.download_button(
-            "📄 Download 3x3 PDF Catalogue",
-            data=pdf_file,
-            file_name="product_catalogue.pdf",
-            mime="application/pdf",
-        )
+            st.download_button(
+                "⬇️ Download Excel",
+                data=excel_file,
+                file_name="product_catalogue.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
-        st.subheader("Preview of matched data")
-        st.dataframe(matched_df)
+            st.download_button(
+                "📄 Download 3x3 PDF Catalogue",
+                data=pdf_file,
+                file_name="product_catalogue.pdf",
+                mime="application/pdf",
+            )
+
+            st.subheader("Preview of matched data")
+            st.dataframe(matched_df)
+
+        except Exception as e:
+            st.error(f"Error while processing: {e}")
