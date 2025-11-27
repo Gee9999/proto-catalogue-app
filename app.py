@@ -16,15 +16,52 @@ st.title("📸 Product Catalogue Builder (Proto Trading)")
 
 
 # -----------------------------------------
-# STEP 1 — Extract prices from PDF using regex
+# Helpers
 # -----------------------------------------
-def extract_prices_from_pdf(pdf_file):
-    items = []
+def normalize_code(code: str) -> str:
+    """
+    Keep only digits so that:
+    86101000001, 86101000001A, 86101000001-10mm-10pcs
+    all normalise to: 86101000001
+    """
+    return re.sub(r"[^0-9]", "", str(code))
 
+
+def get_wanted_codes_from_photos(photos):
+    """
+    From photo filenames, build a set of base codes we care about.
+    e.g. '86101000001-10mm-10pcs.jpg' -> '86101000001'
+    """
+    wanted = set()
+    for f in photos:
+        filename = f.name
+        base_part = filename.split("-")[0]  # part before first dash
+        norm = normalize_code(base_part)
+        if norm:
+            wanted.add(norm)
+    return wanted
+
+
+# -----------------------------------------
+# STEP 1 — Extract ONLY the needed prices from BIG PDF
+# -----------------------------------------
+def extract_prices_for_codes(pdf_file, wanted_codes):
+    """
+    Fast mode:
+    - Scan all pages
+    - For each line starting with a code
+    - If that code matches one of our wanted_codes (normalised),
+      extract DESCRIPTION and PRICE-A INCL (5th decimal number).
+    - Return a dict: norm_code -> {CODE, DESCRIPTION, PRICE_INCL}
+    """
+    price_info = {}
+
+    # Code at start of line
     code_pattern = re.compile(r"^(\d+[A-Za-z]?)\b")
 
     with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
+        total_pages = len(pdf.pages)
+        for page_index, page in enumerate(pdf.pages):
             text = page.extract_text()
             if not text:
                 continue
@@ -34,66 +71,83 @@ def extract_prices_from_pdf(pdf_file):
                 if not line:
                     continue
 
-                if not code_pattern.match(line):
+                m = code_pattern.match(line)
+                if not m:
+                    continue
+
+                orig_code = m.group(1)
+                norm_code = normalize_code(orig_code)
+
+                # Skip lines for codes we don't have photos for
+                if norm_code not in wanted_codes:
                     continue
 
                 parts = line.split()
-                code = parts[0]
 
-                # find all decimal numbers
+                # All decimal numbers on this row
                 numbers = [p for p in parts if re.match(r"^\d+\.\d+$", p)]
+                # We expect at least 5 decimals; the 5th one is PRICE-A INCL
                 if len(numbers) < 5:
                     continue
 
-                # PRICE-A INCL is 5th number
                 price_incl = float(numbers[4])
 
-                # DESCRIPTION: tokens before price numbers
+                # DESCRIPTION = tokens after code until first decimal number
                 desc_tokens = []
                 for p in parts[1:]:
                     if re.match(r"^\d+\.\d+$", p):
                         break
                     desc_tokens.append(p)
-
                 description = " ".join(desc_tokens)
 
-                items.append([code, description, price_incl])
+                # Only keep the first match we see for that code
+                if norm_code not in price_info:
+                    price_info[norm_code] = {
+                        "CODE": orig_code,
+                        "DESCRIPTION": description,
+                        "PRICE_INCL": price_incl,
+                    }
 
-    return pd.DataFrame(items, columns=["CODE", "DESCRIPTION", "PRICE_INCL"])
+    return price_info
 
 
 # -----------------------------------------
-# STEP 2 — Match photos to codes
+# STEP 2 — Build matched DataFrame (one row per photo)
 # -----------------------------------------
-def normalize_code(code):
-    return re.sub(r"[^0-9]", "", str(code))
-
-
-def match_photos_to_prices(price_df, photos):
+def build_matched_df_from_price_info(photos, price_info):
+    """
+    For each photo:
+    - Work out its base code (from filename)
+    - Look up that code in price_info
+    - Build a row with: FILENAME, CODE, DESCRIPTION, PRICE_INCL
+    """
     rows = []
 
     for f in photos:
         filename = f.name
         base_part = filename.split("-")[0]
-        base_code = normalize_code(base_part)
+        norm_code = normalize_code(base_part)
 
-        matches = price_df[
-            price_df["CODE"].astype(str).apply(normalize_code) == base_code
-        ]
+        info = price_info.get(norm_code)
 
-        if not matches.empty:
-            desc = matches.iloc[0]["DESCRIPTION"]
-            price = matches.iloc[0]["PRICE_INCL"]
+        if info:
+            code_val = info["CODE"]
+            desc = info["DESCRIPTION"]
+            price = info["PRICE_INCL"]
         else:
+            # No match found in PDF
+            code_val = norm_code
             desc = "NO MATCH"
             price = ""
 
-        rows.append({
-            "FILENAME": filename,
-            "CODE": base_code,
-            "DESCRIPTION": desc,
-            "PRICE_INCL": price
-        })
+        rows.append(
+            {
+                "FILENAME": filename,
+                "CODE": code_val,
+                "DESCRIPTION": desc,
+                "PRICE_INCL": price,
+            }
+        )
 
     return pd.DataFrame(rows)
 
@@ -135,7 +189,8 @@ def build_excel_with_thumbnails(df, photos):
         if f:
             try:
                 pil_img = PILImage.open(BytesIO(f.getvalue()))
-                pil_img.thumbnail((180, 180))  # double size
+                # Double-size thumbnails
+                pil_img.thumbnail((180, 180))
                 img_buf = BytesIO()
                 pil_img.save(img_buf, format="PNG")
                 img_buf.seek(0)
@@ -143,7 +198,6 @@ def build_excel_with_thumbnails(df, photos):
                 xl_img = XLImage(img_buf)
                 ws.add_image(xl_img, f"A{row_idx}")
                 ws.row_dimensions[row_idx].height = 140
-
             except Exception as e:
                 print("Image load error:", e)
 
@@ -156,9 +210,16 @@ def build_excel_with_thumbnails(df, photos):
 
 
 # -----------------------------------------
-# STEP 4 — 3x3 PDF Catalogue (NO BARCODE)
+# STEP 4 — 3x3 PDF Catalogue (no barcode)
 # -----------------------------------------
 def build_pdf_catalog(df, photos):
+    """
+    3x3 grid per page:
+    - Big image
+    - Price
+    - Description
+    - Page number at bottom
+    """
     file_dict = {f.name: f for f in photos}
 
     buf = BytesIO()
@@ -200,7 +261,6 @@ def build_pdf_catalog(df, photos):
         y0 = margin_bottom + (rows - 1 - row_idx) * cell_h
 
         filename = row["FILENAME"]
-        code = row["CODE"]
         desc = str(row["DESCRIPTION"]) if not pd.isna(row["DESCRIPTION"]) else ""
         price = row["PRICE_INCL"]
 
@@ -222,13 +282,11 @@ def build_pdf_catalog(df, photos):
 
                 iw, ih = pil_img.size
                 img_reader = ImageReader(img_buf)
-
                 img_x = x0 + (cell_w - iw) / 2
                 img_y = y0 + cell_h - ih - 10
 
                 c.drawImage(img_reader, img_x, img_y, width=iw, height=ih)
                 img_height_used = ih
-
             except Exception as e:
                 print("Image error:", e)
 
@@ -260,28 +318,31 @@ st.header("2️⃣ Upload Product Photos")
 photos = st.file_uploader(
     "Upload photos",
     accept_multiple_files=True,
-    type=["jpg", "jpeg", "png"]
+    type=["jpg", "jpeg", "png"],
 )
 
 if st.button("PROCESS"):
     if not price_pdf or not photos:
         st.error("Please upload both the price PDF and photos.")
     else:
-        with st.spinner("Extracting prices..."):
-            price_df = extract_prices_from_pdf(price_pdf)
+        with st.spinner("Reading photo codes..."):
+            wanted_codes = get_wanted_codes_from_photos(photos)
 
-        with st.spinner("Matching photos..."):
-            matched_df = match_photos_to_prices(price_df, photos)
+        with st.spinner("Extracting prices from big PDF (fast mode)..."):
+            price_info = extract_prices_for_codes(price_pdf, wanted_codes)
 
-        # 🩹 FIX STREAMLIT ARROW ERROR
+        with st.spinner("Matching photos to prices..."):
+            matched_df = build_matched_df_from_price_info(photos, price_info)
+
+        # Make Streamlit happy with Arrow types
         matched_df["PRICE_INCL"] = pd.to_numeric(
             matched_df["PRICE_INCL"], errors="coerce"
         )
 
-        with st.spinner("Building Excel..."):
+        with st.spinner("Building Excel with thumbnails..."):
             excel_file = build_excel_with_thumbnails(matched_df, photos)
 
-        with st.spinner("Building PDF..."):
+        with st.spinner("Building 3x3 PDF catalogue..."):
             pdf_file = build_pdf_catalog(matched_df, photos)
 
         st.success("Done! Your files are ready.")
@@ -290,15 +351,15 @@ if st.button("PROCESS"):
             "⬇️ Download Excel",
             data=excel_file,
             file_name="product_catalogue.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
         st.download_button(
             "📄 Download 3x3 PDF Catalogue",
             data=pdf_file,
             file_name="product_catalogue.pdf",
-            mime="application/pdf"
+            mime="application/pdf",
         )
 
-        st.subheader("Preview of Matched Data")
+        st.subheader("Preview of matched data")
         st.dataframe(matched_df)
