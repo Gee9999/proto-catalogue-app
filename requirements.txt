@@ -1,8 +1,6 @@
 streamlit
-pillow
 pandas
-pdfplumber
-openpyxl
+pillow
 reportlab
-python-barcode
-pyarrow
+openpyxl
+pymupdf==1.23.26
