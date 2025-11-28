@@ -1,173 +1,413 @@
-﻿import streamlit as st
-import pandas as pd
-import os
+﻿import os
+import re
 import tempfile
-from PIL import Image
-from fpdf import FPDF
 from io import BytesIO
 
-st.set_page_config(page_title="Proto Catalogue Builder", layout="wide")
-
-# -----------------------------
-# 1) Extract code from filename
-# -----------------------------
-def extract_code_from_filename(filename):
-    code = ""
-    for ch in filename:
-        if ch.isdigit():
-            code += ch
-        else:
-            break
-    return code
+import pandas as pd
+import streamlit as st
+from fpdf import FPDF
+from PIL import Image
 
 
-# ------------------------------------
-# 2) Build Excel with thumbnails
-# ------------------------------------
-def build_excel_with_thumbnails(df, temp_dir):
-    from openpyxl import Workbook
-    from openpyxl.drawing.image import Image as XLImage
+# ---------- Helpers ----------
 
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["Thumbnail", "Code", "Description", "Price Incl", "Filename"])
-
-    ws.column_dimensions["A"].width = 22
-    ws.column_dimensions["B"].width = 15
-    ws.column_dimensions["C"].width = 50
-    ws.column_dimensions["D"].width = 15
-    ws.column_dimensions["E"].width = 40
-
-    for idx, row in df.iterrows():
-        img_path = row["img_path"]
-
-        thumb_path = os.path.join(temp_dir, f"thumb_{idx}.jpg")
-        try:
-            img = Image.open(img_path)
-            img.thumbnail((160, 160))
-            img.save(thumb_path)
-        except:
-            continue
-
-        ws.append(["", row["code"], row["description"], row["price_incl"], row["filename"]])
-
-        xl_img = XLImage(thumb_path)
-        xl_img.width = 160
-        xl_img.height = 160
-        ws.add_image(xl_img, f"A{ws.max_row}")
-
-    out = BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out
+def normalize_header(col) -> str:
+    """
+    Make Excel column headers comparable even if they have spaces, hyphens, dots, or line breaks.
+    Example:
+      "PRICE-A\nINCL." -> "priceaincl"
+      " Price A INCL " -> "priceaincl"
+    """
+    return (
+        str(col)
+        .strip()
+        .replace("-", "")
+        .replace(".", "")
+        .replace(" ", "")
+        .replace("\n", "")
+        .lower()
+    )
 
 
-# ------------------------------------
-# 3) Build PDF (3 per row)
-# ------------------------------------
-def build_pdf(df):
+def normalize_code(val) -> str | None:
+    """
+    Turn any CODE (numeric / string / scientific notation) into a pure digit string.
+    Example:
+      8.6104E+09  -> "8610400000..."
+      "8613900001" -> "8613900001"
+      " 8613900001 " -> "8613900001"
+    """
+    if pd.isna(val):
+        return None
+    s = str(val)
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return digits or None
+
+
+def extract_code_from_filename(filename: str) -> str | None:
+    """
+    Your photos look like:
+      8613900001-25PCS.JPG
+      8613900017-15mm-20pcs.jpg
+      8610400003-50pcs.JPG
+    We take all leading digits from the start of the filename.
+    """
+    basename = os.path.basename(filename)
+    m = re.match(r"^(\d+)", basename)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def longest_common_prefix_len(a: str, b: str) -> int:
+    """Return length of longest common prefix between two strings."""
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
+
+
+def choose_best_code(photo_code: str, codes: pd.Series) -> str | None:
+    """
+    Try:
+      1) Exact match on normalized code.
+      2) If no exact match, pick the code with the longest common prefix.
+         (Your 'base number / closest match' idea.)
+    """
+    if not photo_code:
+        return None
+
+    codes = codes.dropna().astype(str)
+
+    # 1) Exact match
+    exact = codes[codes == photo_code]
+    if not exact.empty:
+        return exact.iloc[0]
+
+    # 2) Longest common prefix
+    best_code = None
+    best_score = 0
+    for c in codes.unique():
+        score = longest_common_prefix_len(photo_code, c)
+        if score > best_score:
+            best_score = score
+            best_code = c
+
+    if best_score == 0:
+        return None
+
+    return best_code
+
+
+def detect_columns(df: pd.DataFrame) -> tuple[str, str, str]:
+    """
+    Auto-detect which columns are CODE, DESCRIPTION, and PRICE-A INCL (or equivalent).
+    Works even if headers are a bit messy.
+    """
+    norm_cols = [normalize_header(c) for c in df.columns]
+
+    code_candidates = {"code", "itemcode", "barcode", "barcodenumber"}
+    desc_candidates = {"description", "desc"}
+    price_candidates = {"priceaincl", "pricea", "priceincl", "sellingpriceincl", "sellpriceincl"}
+
+    code_col = None
+    desc_col = None
+    price_col = None
+
+    for original, norm in zip(df.columns, norm_cols):
+        if code_col is None and norm in code_candidates:
+            code_col = original
+        if desc_col is None and norm in desc_candidates:
+            desc_col = original
+        if price_col is None and norm in price_candidates:
+            price_col = original
+
+    # If any still None, fall back to fuzzy contains
+    if code_col is None:
+        for original, norm in zip(df.columns, norm_cols):
+            if "code" in norm or "barcode" in norm:
+                code_col = original
+                break
+
+    if desc_col is None:
+        for original, norm in zip(df.columns, norm_cols):
+            if "description" in norm or norm.startswith("desc"):
+                desc_col = original
+                break
+
+    if price_col is None:
+        for original, norm in zip(df.columns, norm_cols):
+            if "price" in norm and ("incl" in norm or "a" in norm):
+                price_col = original
+                break
+
+    if not code_col or not desc_col or not price_col:
+        raise ValueError(
+            "Could not automatically detect CODE / DESCRIPTION / PRICE columns.\n"
+            "Make sure your file has logical headers like CODE, DESCRIPTION, PRICE-AINCL."
+        )
+
+    return code_col, desc_col, price_col
+
+
+def format_price(val) -> str:
+    try:
+        return f"{float(val):.2f}"
+    except Exception:
+        return str(val)
+
+
+def build_pdf(records: list[dict]) -> bytes:
+    """
+    Build a PDF catalogue:
+      - 3 items per row
+      - image on top
+      - below: code, description, price
+    """
+    if not records:
+        return b""
+
     pdf = FPDF("P", "mm", "A4")
-    pdf.set_auto_page_break(auto=True, margin=8)
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
 
-    cell_w = 60
-    cell_h = 60
+    # Title
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, "Photo Catalogue", ln=1, align="C")
+    pdf.ln(3)
 
-    for i in range(0, len(df), 3):
-        row = df.iloc[i:i+3]
-        pdf.add_page()
+    margin = 10
+    columns = 3
+    page_width = pdf.w - 2 * margin
+    cell_w = page_width / columns
+    img_h = 40  # image height
+    text_h = 12  # space for code/desc/price
+    row_h = img_h + text_h + 5
 
-        # FIRST ROW: IMAGES
-        x = 10
-        for _, r in row.iterrows():
-            try:
-                img = Image.open(r["img_path"])
-                img_path = r["img_path"]
-                pdf.image(img_path, x=x, y=20, w=cell_w)
-            except:
-                pass
-            x += cell_w + 10
+    x_start = margin
+    y = pdf.get_y()
 
-        # SECOND ROW: DESCRIPTION + PRICE + CODE
-        x = 10
-        y_text = 85
-        pdf.set_font("Arial", size=10)
+    for idx, rec in enumerate(records):
+        col = idx % columns
+        if col == 0 and idx != 0:
+            # new row
+            y += row_h
+            if y + row_h > (pdf.h - pdf.b_margin):
+                pdf.add_page()
+                y = margin
 
-        for _, r in row.iterrows():
-            pdf.set_xy(x, y_text)
-            pdf.multi_cell(cell_w, 5, f"{r['description']}", 0, "L")
+        x = x_start + col * cell_w
 
-            pdf.set_xy(x, y_text + 18)
-            pdf.set_font("Arial", size=10)
-            pdf.cell(cell_w, 5, f"Price: {r['price_incl']}", 0, 2)
+        # Draw image
+        pdf.set_xy(x, y)
+        try:
+            pdf.image(rec["tmp_path"], x=x + 2, y=y, w=cell_w - 4, h=img_h)
+        except Exception:
+            # if image fails, just ignore but still show text
+            pass
 
-            pdf.set_font("Arial", size=9)
-            pdf.cell(cell_w, 5, f"Code: {r['code']}", 0, 2)
+        # Text below
+        pdf.set_xy(x, y + img_h + 1)
+        pdf.set_font("Arial", size=8)
 
-            x += cell_w + 10
+        code_line = f"Code: {rec.get('code_display', '')}"
+        desc_line = rec.get("description", "") or ""
+        price_line = f"Price A incl: {rec.get('price', '')}"
+
+        pdf.cell(cell_w, 4, code_line[:60], ln=1)
+        pdf.set_x(x)
+        pdf.cell(cell_w, 4, desc_line[:60], ln=1)
+        pdf.set_x(x)
+        pdf.cell(cell_w, 4, price_line[:60], ln=1)
+
+    # Return PDF as bytes
+    return pdf.output(dest="S").encode("latin1")
+
+
+def build_excel(records: list[dict]) -> bytes:
+    """
+    Create a simple Excel with:
+      PHOTO, CODE, DESCRIPTION, PRICE_A_INCL, MATCH_STATUS
+    (No thumbnails – avoids the .mpo / mimetype issues.)
+    """
+    if not records:
+        df = pd.DataFrame(
+            columns=["PHOTO", "CODE", "DESCRIPTION", "PRICE_A_INCL", "MATCH_STATUS"]
+        )
+    else:
+        rows = []
+        for rec in records:
+            rows.append(
+                {
+                    "PHOTO": rec.get("photo_name", ""),
+                    "CODE": rec.get("code_display", ""),
+                    "DESCRIPTION": rec.get("description", ""),
+                    "PRICE_A_INCL": rec.get("price", ""),
+                    "MATCH_STATUS": rec.get("match_status", ""),
+                }
+            )
+        df = pd.DataFrame(rows)
 
     out = BytesIO()
-    pdf.output(out)
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Catalogue")
     out.seek(0)
-    return out
+    return out.getvalue()
 
 
-# ------------------------------------
-# STREAMLIT UI
-# ------------------------------------
-st.title("📸 Proto Catalogue Builder")
-st.subheader("Auto-match photos → price + description → Excel + PDF")
+# ---------- Streamlit App ----------
 
+def main():
+    st.set_page_config(page_title="Photo Catalogue Builder", layout="centered")
+    st.title("📸 Photo Catalogue Builder")
 
-uploaded_excel = st.file_uploader("Upload price Excel file", type=["xlsx"])
-uploaded_images = st.file_uploader("Upload product photos", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+    st.markdown(
+        """
+Upload:
 
-if uploaded_excel and uploaded_images:
-    st.success("Files uploaded successfully!")
+1. **Price Excel** (e.g. `PRODUCT DETAILS - BY CODE.xlsx`)  
+2. **Product photos** (`.jpg` / `.jpeg` / `.png`)
 
-    df = pd.read_excel(uploaded_excel)
+The app will:
+- Extract the numeric code from each photo filename (e.g. `8610400003-50pcs.JPG` → `8610400003`)
+- Match that to your Excel by **CODE**
+- Pull **DESCRIPTION** and **PRICE A incl.**
+- Generate:
+  - A **PDF catalogue** with photos + code + description + price
+  - An **Excel file** with the matched data
+        """
+    )
 
-    # Standardize column names
-    df.columns = df.columns.str.strip().str.upper()
+    st.info(
+        "Excel should logically contain columns for **CODE**, **DESCRIPTION**, and **PRICE-A INCL**.\n"
+        "Header text can be messy (hyphens, dots, line breaks) – I'll normalize it."
+    )
 
-    if not {"CODE", "DESCRIPTION", "PRICE-AINCL."}.issubset(df.columns):
-        st.error("Excel must contain columns: CODE, DESCRIPTION, PRICE-AINCL.")
+    price_file = st.file_uploader(
+        "Upload Excel price file",
+        type=["xlsx", "xls"],
+        help="Example: PRODUCT DETAILS - BY CODE.xlsx",
+    )
+
+    photo_files = st.file_uploader(
+        "Upload product photos",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True,
+        help="Filenames should start with the numeric code, e.g. 8613900001-25PCS.JPG",
+    )
+
+    if not price_file or not photo_files:
         st.stop()
 
-    price_map = {}
-    for _, r in df.iterrows():
-        code = str(r["CODE"]).split(".")[0]
-        price = r["PRICE-AINCL."]
-        desc = str(r["DESCRIPTION"])
-        price_map[code] = (desc, price)
+    if st.button("🔄 Build PDF + Excel catalogue"):
+        with st.spinner("Processing..."):
+            try:
+                # --- 1. Read Excel ---
+                df = pd.read_excel(price_file)
 
-    matched_rows = []
-    temp_dir = tempfile.mkdtemp()
+                code_col, desc_col, price_col = detect_columns(df)
 
-    for img in uploaded_images:
-        filename = img.name
-        file_path = os.path.join(temp_dir, filename)
+                # Keep only the 3 key columns, standardised
+                df = df[[code_col, desc_col, price_col]].copy()
+                df.columns = ["CODE", "DESCRIPTION", "PRICE_RAW"]
 
-        with open(file_path, "wb") as f:
-            f.write(img.read())
+                # Normalized code for joining
+                df["CODE_KEY"] = df["CODE"].apply(normalize_code)
+                df = df[df["CODE_KEY"].notna()]
 
-        code = extract_code_from_filename(filename)
-        desc, price = price_map.get(code, ("", ""))
+                # --- 2. Process photos & match ---
+                records = []
 
-        matched_rows.append({
-            "filename": filename,
-            "code": code,
-            "description": desc,
-            "price_incl": price,
-            "img_path": file_path
-        })
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    all_codes = df["CODE_KEY"]
 
-    matched_df = pd.DataFrame(matched_rows)
+                    for uploaded in photo_files:
+                        photo_name = uploaded.name
+                        image_bytes = uploaded.getvalue()
 
-    st.subheader("Download Excel")
-    excel_file = build_excel_with_thumbnails(matched_df, temp_dir)
-    st.download_button("Download Excel", excel_file, file_name="catalogue.xlsx")
+                        # save to temp for PDF
+                        tmp_path = os.path.join(tmpdir, photo_name)
+                        with open(tmp_path, "wb") as f:
+                            f.write(image_bytes)
 
-    st.subheader("Download PDF")
-    pdf_file = build_pdf(matched_df)
-    st.download_button("Download PDF", pdf_file, file_name="catalogue.pdf")
+                        photo_code = extract_code_from_filename(photo_name)
+                        best_code = choose_best_code(photo_code, all_codes) if photo_code else None
 
+                        if best_code is None:
+                            # No match found
+                            rec = {
+                                "photo_name": photo_name,
+                                "tmp_path": tmp_path,
+                                "code_display": photo_code or "",
+                                "description": "",
+                                "price": "",
+                                "match_status": "NO MATCH",
+                            }
+                        else:
+                            row = df[df["CODE_KEY"] == best_code].iloc[0]
+                            description = row.get("DESCRIPTION", "")
+                            price = format_price(row.get("PRICE_RAW", ""))
+
+                            # Decide if exact or fuzzy
+                            if photo_code == best_code:
+                                status = "EXACT"
+                            else:
+                                status = "BEST PREFIX"
+
+                            rec = {
+                                "photo_name": photo_name,
+                                "tmp_path": tmp_path,
+                                "code_display": str(row.get("CODE", best_code)),
+                                "description": str(description),
+                                "price": price,
+                                "match_status": status,
+                            }
+
+                        records.append(rec)
+
+                    # --- 3. Build PDF & Excel ---
+                    pdf_bytes = build_pdf(records)
+                    excel_bytes = build_excel(records)
+
+                # --- 4. Show preview table in Streamlit ---
+                preview_rows = [
+                    {
+                        "PHOTO": r["photo_name"],
+                        "CODE": r["code_display"],
+                        "DESCRIPTION": r["description"],
+                        "PRICE_A_INCL": r["price"],
+                        "MATCH_STATUS": r["match_status"],
+                    }
+                    for r in records
+                ]
+                preview_df = pd.DataFrame(preview_rows)
+                st.subheader("Preview of matched items")
+                st.dataframe(preview_df, use_container_width=True)
+
+                # --- 5. Download buttons ---
+                st.subheader("Downloads")
+
+                st.download_button(
+                    "⬇️ Download PDF catalogue",
+                    data=pdf_bytes,
+                    file_name="photo_catalogue.pdf",
+                    mime="application/pdf",
+                )
+
+                st.download_button(
+                    "⬇️ Download Excel (CODE + DESC + PRICE)",
+                    data=excel_bytes,
+                    file_name="photo_catalogue.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                )
+
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
+
+
+if __name__ == "__main__":
+    main()
