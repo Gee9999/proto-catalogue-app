@@ -1,7 +1,7 @@
 ﻿import io
 import re
 import tempfile
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Dict, Any
 
 import pandas as pd
 from PIL import Image
@@ -86,7 +86,6 @@ def extract_code_from_filename(filename: str) -> Optional[str]:
     Extract the first long (6+ digit) number from the photo filename.
     This is your product code by Option 1 rule.
     """
-    # Remove extension first
     base = filename.rsplit(".", 1)[0]
     match = re.search(r"\d{6,}", base)
     if not match:
@@ -94,16 +93,22 @@ def extract_code_from_filename(filename: str) -> Optional[str]:
     return match.group(0)
 
 
-def normalize_code(val: Any) -> Optional[str]:
-    """Normalize Excel code to a pure digit string, or None."""
+def normalize_code_from_excel(val: Any) -> Optional[str]:
+    """
+    Normalise the CODE from Excel to the same style as filenames:
+    - Try first long digit sequence (6+ digits)
+    - Fallback: strip non-digits
+    """
     if pd.isna(val):
         return None
     s = str(val).strip()
-    # Remove everything except digits
-    s = re.sub(r"[^\d]", "", s)
-    if not s:
-        return None
-    return s
+    # Prefer a long block of digits, same as filenames
+    m = re.search(r"\d{6,}", s)
+    if m:
+        return m.group(0)
+    # Fallback: all digits
+    digits = re.sub(r"[^\d]", "", s)
+    return digits if digits else None
 
 
 # -----------------------------
@@ -122,13 +127,14 @@ def build_matched_df(price_df: pd.DataFrame,
     """
     # Create a normalized key column for codes in the Excel
     price_df = price_df.copy()
-    price_df["CODE_KEY"] = price_df[code_col].apply(normalize_code)
+    price_df["CODE_KEY"] = price_df[code_col].apply(normalize_code_from_excel)
 
     # Build a lookup dict: code_key -> row dict
     code_to_row: Dict[str, Dict[str, Any]] = {}
     for _, row in price_df.iterrows():
         key = row["CODE_KEY"]
         if key:
+            # If duplicates, last one wins – fine for your catalogue
             code_to_row[key] = {
                 "CODE": row[code_col],
                 "DESCRIPTION": row[desc_col],
@@ -207,11 +213,15 @@ def build_excel_with_thumbnails(df: pd.DataFrame, temp_dir: str) -> bytes:
         try:
             img = Image.open(file)
             img.thumbnail((120, 120))
+
             tmp = tempfile.NamedTemporaryFile(
                 dir=temp_dir, suffix=".png", delete=False
             )
-            img.save(tmp.name, format="PNG")
-            xl_img = XLImage(tmp.name)
+            tmp_path = tmp.name
+            tmp.close()  # close handle so Excel can re-open it
+            img.save(tmp_path, format="PNG")
+
+            xl_img = XLImage(tmp_path)
             xl_img.anchor = f"A{row_idx}"
             ws.add_image(xl_img)
         except Exception:
@@ -246,7 +256,6 @@ def build_pdf_grid(df: pd.DataFrame, temp_dir: str) -> bytes:
     cols = 3
 
     margin_x = 10
-    margin_y = 10
     cell_w = (210 - 2 * margin_x) / cols  # A4 width ~210mm
     img_h = 40
     text_h = 16
@@ -282,11 +291,15 @@ def build_pdf_grid(df: pd.DataFrame, temp_dir: str) -> bytes:
         try:
             img = Image.open(file).convert("RGB")
             img.thumbnail((int(cell_w - 10), img_h * 3))  # safe size
+
             tmp = tempfile.NamedTemporaryFile(
                 dir=temp_dir, suffix=".jpg", delete=False
             )
-            img.save(tmp.name, format="JPEG")
-            pdf.image(tmp.name, x=x + 5, y=y, w=cell_w - 10)
+            tmp_path = tmp.name
+            tmp.close()  # close handle so FPDF can re-open it
+            img.save(tmp_path, format="JPEG")
+
+            pdf.image(tmp_path, x=x + 5, y=y, w=cell_w - 10)
         except Exception:
             pass
 
@@ -305,7 +318,13 @@ def build_pdf_grid(df: pd.DataFrame, temp_dir: str) -> bytes:
         text_block = "\n".join(text_lines)
         pdf.multi_cell(cell_w, 4, text_block, 0, "L")
 
-    pdf_bytes = pdf.output(dest="S").encode("latin1")
+    # fpdf2 may return str, bytes, or bytearray depending on version
+    res = pdf.output(dest="S")
+    if isinstance(res, (bytes, bytearray)):
+        pdf_bytes = bytes(res)
+    else:
+        pdf_bytes = res.encode("latin1")
+
     return pdf_bytes
 
 
@@ -347,6 +366,8 @@ if uploaded_photos and uploaded_price:
                 code_col = find_code_col(price_df)
                 desc_col = find_desc_col(price_df)
                 price_col = find_price_incl_col(price_df)
+
+                st.caption(f"Using columns → CODE: `{code_col}`, DESCRIPTION: `{desc_col}`, PRICE INCL: `{price_col}`")
 
                 # Build matched DF
                 matched_df = build_matched_df(
