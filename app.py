@@ -1,313 +1,411 @@
 ﻿import io
-import os
 import re
-from typing import Dict, List, Tuple
+import tempfile
+from typing import Optional, Dict, Any
 
 import pandas as pd
-import streamlit as st
 from PIL import Image
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas
+
+import streamlit as st
+from fpdf import FPDF
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
 
 
-# ---------- Helpers for Excel ----------
+# -----------------------------
+# Helpers: column detection
+# -----------------------------
 
-def normalise_colname(col: str) -> str:
-    if not isinstance(col, str):
-        col = str(col)
-    return (
-        col.upper()
-        .replace(" ", "")
-        .replace("\n", "")
-        .replace("\r", "")
-        .replace("_X000A_", "")
-    )
+def find_code_col(df: pd.DataFrame) -> str:
+    """Try to find the product code column in a generic Excel file."""
+    cols = list(df.columns)
+
+    # 1) Exact match
+    for col in cols:
+        if str(col).strip().lower() == "code":
+            return col
+
+    # 2) Contains word "code" or "barcode" or "item"
+    for col in cols:
+        name = str(col).strip().lower()
+        if "barcode" in name or "code" in name or "item" in name:
+            return col
+
+    raise ValueError("Could not find a CODE column (e.g. 'CODE', 'Barcode', 'ItemCode').")
 
 
-def detect_columns(df: pd.DataFrame) -> Tuple[str, str, str]:
+def find_desc_col(df: pd.DataFrame) -> str:
+    """Try to find the description column."""
+    cols = list(df.columns)
+
+    # 1) Exact "description"
+    for col in cols:
+        if str(col).strip().lower() == "description":
+            return col
+
+    # 2) Contains desc/name/product
+    for col in cols:
+        name = str(col).strip().lower()
+        if "description" in name or "desc" in name or "name" in name or "product" in name:
+            return col
+
+    raise ValueError("Could not find a DESCRIPTION column (e.g. 'DESCRIPTION', 'Product Name').")
+
+
+def find_price_incl_col(df: pd.DataFrame) -> str:
+    """Try to find the VAT-inclusive price column."""
+    cols = list(df.columns)
+
+    # 1) Very likely names: includes 'incl' & ('price' or 'vat')
+    for col in cols:
+        name = str(col).strip().lower()
+        if "incl" in name and ("price" in name or "vat" in name):
+            return col
+
+    # 2) Any column with 'price a incl' / 'price-a incl' etc.
+    for col in cols:
+        name = str(col).strip().lower().replace(" ", "").replace("-", "")
+        if "priceaincl" in name or "priceincl" in name:
+            return col
+
+    # 3) Fallback: first column containing 'price'
+    for col in cols:
+        name = str(col).strip().lower()
+        if "price" in name:
+            return col
+
+    raise ValueError("Could not find a VAT-inclusive price column (e.g. 'PRICE-A INCL').")
+
+
+# -----------------------------
+# Helpers: code extraction & normalisation
+# -----------------------------
+
+def extract_code_from_filename(filename: str) -> Optional[str]:
     """
-    Try to guess the CODE, DESCRIPTION and PRICE-A INCL columns.
-    Returns (code_col, desc_col, price_col).
-    Raises ValueError if something important is missing.
+    Extract the first long (6+ digit) number from the photo filename.
+    This is your product code by Option 1 rule.
     """
-    code_col = None
-    desc_col = None
-    price_col = None
-
-    for col in df.columns:
-        n = normalise_colname(col)
-        if code_col is None and "CODE" in n:
-            code_col = col
-        if desc_col is None and ("DESC" in n or "DESCRIPTION" in n):
-            desc_col = col
-        if price_col is None and "PRICE" in n and "INCL" in n:
-            price_col = col
-
-    if code_col is None:
-        raise ValueError("Could not find CODE column in the price file.")
-    if desc_col is None:
-        raise ValueError("Could not find DESCRIPTION column in the price file.")
-    if price_col is None:
-        raise ValueError("Could not find VAT inclusive price column in the price file.")
-
-    return code_col, desc_col, price_col
+    base = filename.rsplit(".", 1)[0]
+    match = re.search(r"\d{6,}", base)
+    if not match:
+        return None
+    return match.group(0)
 
 
-def load_price_table(excel_file) -> pd.DataFrame:
-    df = pd.read_excel(excel_file)
-    code_col, desc_col, price_col = detect_columns(df)
-
-    # Clean up / standardise
-    df = df[[code_col, desc_col, price_col]].copy()
-    df.columns = ["CODE", "DESCRIPTION", "PRICE_A_INCL"]
-
-    # Normalise code to a clean numeric string
-    df["CODE_STR"] = (
-        df["CODE"]
-        .astype(str)
-        .str.strip()
-        .str.extract(r"(\d+)", expand=False)
-    )
-
-    return df
-
-
-# ---------- Helpers for photos & matching ----------
-
-def extract_code_from_filename(filename: str) -> str:
+def normalize_code_from_excel(val: Any) -> Optional[str]:
     """
-    Extract the longest leading number sequence from the filename.
-    e.g. '8613900001-25pcs.jpg' -> '8613900001'
+    Normalise the CODE from Excel to the same style as filenames:
+    - Try first long digit sequence (6+ digits)
+    - Fallback: strip non-digits
     """
-    base = os.path.basename(filename)
-    # Take part before first non-digit after starting digits
-    m = re.match(r"(\d+)", base)
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
+    # Prefer a long block of digits, same as filenames
+    m = re.search(r"\d{6,}", s)
     if m:
-        return m.group(1)
-    # Fallback: first digit group anywhere
-    m = re.search(r"(\d+)", base)
-    return m.group(1) if m else ""
+        return m.group(0)
+    # Fallback: all digits
+    digits = re.sub(r"[^\d]", "", s)
+    return digits if digits else None
 
 
-def match_photos_to_prices(
-    photos: List[st.runtime.uploaded_file_manager.UploadedFile],
-    price_df: pd.DataFrame,
-) -> pd.DataFrame:
+# -----------------------------
+# Build matched DataFrame
+# -----------------------------
+
+def build_matched_df(price_df: pd.DataFrame,
+                     uploaded_photos: list,
+                     code_col: str,
+                     desc_col: str,
+                     price_col: str) -> pd.DataFrame:
     """
-    Exact matching: photo code must match CODE_STR.
-    Returns a DataFrame with one row per photo that found a match.
+    For each uploaded photo, extract code from filename,
+    match exactly to Excel, and return a DataFrame with:
+      FILENAME, FILE, CODE, DESCRIPTION, PRICE_INCL
     """
-    code_index: Dict[str, Dict[str, object]] = (
-        price_df.set_index("CODE_STR")[["CODE", "DESCRIPTION", "PRICE_A_INCL"]].to_dict("index")
-    )
+    # Create a normalized key column for codes in the Excel
+    price_df = price_df.copy()
+    price_df["CODE_KEY"] = price_df[code_col].apply(normalize_code_from_excel)
+
+    # Build a lookup dict: code_key -> row dict
+    code_to_row: Dict[str, Dict[str, Any]] = {}
+    for _, row in price_df.iterrows():
+        key = row["CODE_KEY"]
+        if key:
+            # If duplicates, last one wins – fine for your catalogue
+            code_to_row[key] = {
+                "CODE": row[code_col],
+                "DESCRIPTION": row[desc_col],
+                "PRICE_INCL": row[price_col],
+            }
 
     records = []
-    for up in photos:
-        fname = up.name
-        code = extract_code_from_filename(fname)
-        info = code_index.get(code)
-        if info is None:
-            # No match – just skip this photo
-            continue
 
-        records.append(
-            {
-                "PHOTO_FILE": fname,
-                "CODE": info["CODE"],
-                "DESCRIPTION": info["DESCRIPTION"],
-                "PRICE-A INCL.": info["PRICE_A_INCL"],
-            }
-        )
+    for file in uploaded_photos:
+        filename = file.name
+        extracted_code = extract_code_from_filename(filename)
+        rec_code = ""
+        rec_desc = ""
+        rec_price = ""
+
+        if extracted_code and extracted_code in code_to_row:
+            data = code_to_row[extracted_code]
+            rec_code = str(data["CODE"])
+            rec_desc = str(data["DESCRIPTION"])
+            rec_price = data["PRICE_INCL"]
+        else:
+            # No match found
+            rec_code = extracted_code or ""
+            rec_desc = ""
+            rec_price = ""
+
+        records.append({
+            "FILENAME": filename,
+            "FILE": file,
+            "CODE": rec_code,
+            "DESCRIPTION": rec_desc,
+            "PRICE_INCL": rec_price,
+        })
 
     return pd.DataFrame(records)
 
 
-# ---------- PDF generation (no encode, returns BytesIO) ----------
+# -----------------------------
+# Excel with thumbnails
+# -----------------------------
 
-def build_pdf_catalog(matched_df: pd.DataFrame, photos: List[st.runtime.uploaded_file_manager.UploadedFile]) -> io.BytesIO:
+def build_excel_with_thumbnails(df: pd.DataFrame, temp_dir: str) -> bytes:
     """
-    Build a simple photo catalogue PDF with 2 columns:
-    image + CODE + DESCRIPTION + PRICE-A INCL.
+    Create an Excel file with:
+      Col A: Photo thumbnail
+      Col B: CODE
+      Col C: DESCRIPTION
+      Col D: PRICE_INCL
     """
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    page_w, page_h = A4
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Catalogue"
 
-    margin = 15 * mm
-    col_gap = 5 * mm
-    num_cols = 2
-    cell_w = (page_w - 2 * margin - col_gap * (num_cols - 1)) / num_cols
-    max_img_h = 40 * mm
-    text_line_height = 9
+    headers = ["PHOTO", "CODE", "DESCRIPTION", "PRICE_INCL"]
+    ws.append(headers)
 
-    # Map photo name -> UploadedFile for easy lookup
-    photo_map = {p.name: p for p in photos}
+    # Column widths
+    ws.column_dimensions["A"].width = 20
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 50
+    ws.column_dimensions["D"].width = 15
 
-    y = page_h - margin
-    col = 0
-
-    # Ensure column name is easy to use
-    df = matched_df.copy()
-    if "PRICE-A INCL." in df.columns:
-        df = df.rename(columns={"PRICE-A INCL.": "PRICE"})
+    row_idx = 2
 
     for _, row in df.iterrows():
-        photo_name = row["PHOTO_FILE"]
-        up = photo_map.get(photo_name)
-        if up is None:
-            continue
+        # Set a decent row height for thumbnails
+        ws.row_dimensions[row_idx].height = 80
 
-        # Convert uploaded bytes to an ImageReader
-        img_bytes = io.BytesIO(up.getvalue())
+        # Write text cells
+        ws.cell(row=row_idx, column=2, value=row["CODE"])
+        ws.cell(row=row_idx, column=3, value=row["DESCRIPTION"])
+        ws.cell(row=row_idx, column=4, value=row["PRICE_INCL"])
+
+        # Add thumbnail in column A
+        file = row["FILE"]
         try:
-            img_reader = ImageReader(img_bytes)
-            iw, ih = img_reader.getSize()
+            img = Image.open(file)
+            img.thumbnail((120, 120))
+
+            tmp = tempfile.NamedTemporaryFile(
+                dir=temp_dir, suffix=".png", delete=False
+            )
+            tmp_path = tmp.name
+            tmp.close()  # close handle so Excel can re-open it
+            img.save(tmp_path, format="PNG")
+
+            xl_img = XLImage(tmp_path)
+            xl_img.anchor = f"A{row_idx}"
+            ws.add_image(xl_img)
         except Exception:
-            # If image is somehow unreadable, skip image but still print text
-            img_reader = None
-            iw, ih = (1, 1)
+            # If image fails, leave cell blank
+            pass
 
-        scale = min((cell_w - 10) / iw, max_img_h / ih) if img_reader else 1.0
-        img_w = iw * scale
-        img_h = ih * scale if img_reader else 0
+        row_idx += 1
 
-        # Start new row if needed
-        needed_height = img_h + 3 * text_line_height + 15
-        if y - needed_height < margin:
-            c.showPage()
-            y = page_h - margin
-            col = 0
-
-        if col == 0:
-            x = margin
-        else:
-            x = margin + cell_w + col_gap
-
-        # Draw image
-        if img_reader:
-            img_x = x + (cell_w - img_w) / 2
-            img_y = y - img_h
-            c.drawImage(img_reader, img_x, img_y, width=img_w, height=img_h, preserveAspectRatio=True)
-        else:
-            img_y = y
-
-        text_y = img_y - 8
-        c.setFont("Helvetica-Bold", 8)
-        c.drawString(x, text_y, f"CODE: {row['CODE']}")
-        text_y -= text_line_height
-
-        c.setFont("Helvetica", 8)
-        desc = str(row.get("DESCRIPTION", "") or "")
-        # Simple truncation – you can improve with manual wrapping later
-        c.drawString(x, text_y, f"DESC: {desc[:70]}")
-        text_y -= text_line_height
-
-        price_val = row.get("PRICE", "")
-        c.drawString(x, text_y, f"PRICE (incl): {price_val}")
-        text_y -= text_line_height
-
-        # Move to next column / row
-        if col == 0:
-            col = 1
-        else:
-            col = 0
-            y = text_y - 10
-
-    c.save()
-    buf.seek(0)
-    return buf
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
 
 
-# ---------- Excel generation ----------
+# -----------------------------
+# PDF 3×3 grid builder
+# -----------------------------
 
-def build_excel_catalog(matched_df: pd.DataFrame) -> io.BytesIO:
+def build_pdf_grid(df: pd.DataFrame, temp_dir: str) -> bytes:
     """
-    Create a simple Excel with columns:
-    PHOTO_FILE, CODE, DESCRIPTION, PRICE-A INCL.
-    (and NO images – just data)
+    Build a 3x3 grid PDF:
+      - Photo
+      - Code
+      - Description
+      - Price
+    under each image.
     """
-    buf = io.BytesIO()
-    out_df = matched_df[["PHOTO_FILE", "CODE", "DESCRIPTION", "PRICE-A INCL."]].copy()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        out_df.to_excel(writer, index=False, sheet_name="Catalogue")
-    buf.seek(0)
-    return buf
+    pdf = FPDF(unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=10)
 
+    images_per_page = 9
+    cols = 3
 
-# ---------- Streamlit UI ----------
+    margin_x = 10
+    cell_w = (210 - 2 * margin_x) / cols  # A4 width ~210mm
+    img_h = 40
+    text_h = 16
+    top_y = 20
 
-def main():
-    st.title("Photo Catalogue Builder")
+    for idx, row in df.iterrows():
+        # New page every 9 items
+        if idx % images_per_page == 0:
+            pdf.add_page()
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 10, "Photo Catalogue", ln=1, align="C")
+            pdf.ln(2)
 
-    st.markdown(
-        """
-        1. Upload your **price Excel file** (any layout, as long as it has a CODE, DESCRIPTION and VAT-inclusive price column).  
-        2. Upload the **product photos** (filenames must contain the product code, e.g. `8613900001-25pcs.jpg`).  
-        3. Click **Generate catalogue** to get:
-           - A **PDF photo catalogue**  
-           - A matching **Excel file** with columns `PHOTO_FILE`, `CODE`, `DESCRIPTION`, `PRICE-A INCL.`
-        """
-    )
+        pos_in_page = idx % images_per_page
+        row_idx = pos_in_page // cols
+        col_idx = pos_in_page % cols
 
-    price_file = st.file_uploader(
-        "Upload price Excel (e.g. PRODUCT DETAILS - BY CODE.xlsx)",
-        type=["xls", "xlsx"],
-        key="price_file",
-    )
+        x = margin_x + col_idx * cell_w
+        y = top_y + row_idx * (img_h + text_h + 6)
 
-    photo_files = st.file_uploader(
-        "Upload product photos",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-        key="photo_files",
-    )
+        file = row["FILE"]
+        code = str(row["CODE"]) if row["CODE"] else ""
+        desc = str(row["DESCRIPTION"]) if row["DESCRIPTION"] else ""
+        price = row["PRICE_INCL"]
+        price_str = ""
+        if price is not None and price != "":
+            try:
+                price_str = f"{float(price):.2f}"
+            except Exception:
+                price_str = str(price)
 
-    if st.button("Generate catalogue"):
-
-        if not price_file:
-            st.error("Please upload a price Excel file first.")
-            return
-        if not photo_files:
-            st.error("Please upload at least one product photo.")
-            return
-
+        # Add image
         try:
-            price_df = load_price_table(price_file)
-        except Exception as e:
-            st.error(f"Couldn't read price file: {e}")
-            return
+            img = Image.open(file).convert("RGB")
+            img.thumbnail((int(cell_w - 10), img_h * 3))  # safe size
 
-        matched_df = match_photos_to_prices(photo_files, price_df)
+            tmp = tempfile.NamedTemporaryFile(
+                dir=temp_dir, suffix=".jpg", delete=False
+            )
+            tmp_path = tmp.name
+            tmp.close()  # close handle so FPDF can re-open it
+            img.save(tmp_path, format="JPEG")
 
-        if matched_df.empty:
-            st.warning("No photos matched any product codes from the Excel file.")
-            return
+            pdf.image(tmp_path, x=x + 5, y=y, w=cell_w - 10)
+        except Exception:
+            pass
 
-        st.success(f"Matched {len(matched_df)} photos to products.")
-        st.dataframe(matched_df)
+        # Text under image
+        pdf.set_xy(x, y + img_h + 1)
+        pdf.set_font("Arial", size=8)
 
-        # Build Excel
-        excel_buf = build_excel_catalog(matched_df)
+        text_lines = []
+        if code:
+            text_lines.append(f"Code: {code}")
+        if desc:
+            text_lines.append(desc)
+        if price_str:
+            text_lines.append(f"Price: {price_str}")
 
-        # Build PDF
-        pdf_buf = build_pdf_catalog(matched_df, photo_files)
+        text_block = "\n".join(text_lines)
+        pdf.multi_cell(cell_w, 4, text_block, 0, "L")
 
-        st.download_button(
-            "Download Excel catalogue",
-            data=excel_buf,
-            file_name="photo_catalogue.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    # fpdf2 may return str, bytes, or bytearray depending on version
+    res = pdf.output(dest="S")
+    if isinstance(res, (bytes, bytearray)):
+        pdf_bytes = bytes(res)
+    else:
+        pdf_bytes = res.encode("latin1")
 
-        st.download_button(
-            "Download PDF catalogue",
-            data=pdf_buf,
-            file_name="photo_catalogue.pdf",
-            mime="application/pdf",
-        )
+    return pdf_bytes
 
 
-if __name__ == "__main__":
-    main()
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
+st.set_page_config(page_title="Photo Catalogue Builder", layout="wide")
+st.title("📸 Photo Catalogue Builder")
+st.write(
+    "Upload your **photos** and a **price Excel file**. "
+    "I'll match by code in the filename and build both an Excel and a PDF with "
+    "Photo + Code + Description + Price."
+)
+
+st.markdown("### 1️⃣ Upload Photos")
+uploaded_photos = st.file_uploader(
+    "Select multiple product photos",
+    type=["jpg", "jpeg", "png"],
+    accept_multiple_files=True,
+    help="Filenames must contain the product code, e.g. 8613900001-25pcs.jpg",
+)
+
+st.markdown("### 2️⃣ Upload Price Excel")
+uploaded_price = st.file_uploader(
+    "Upload the Excel price list",
+    type=["xls", "xlsx"],
+    help="I'll auto-detect Code, Description, and VAT-inclusive Price columns.",
+)
+
+if uploaded_photos and uploaded_price:
+    if st.button("🔍 Match Photos & Build Catalogue"):
+        with st.spinner("Processing... please wait"):
+            try:
+                # Read Excel
+                price_df = pd.read_excel(uploaded_price)
+
+                # Detect columns
+                code_col = find_code_col(price_df)
+                desc_col = find_desc_col(price_df)
+                price_col = find_price_incl_col(price_df)
+
+                st.caption(f"Using columns → CODE: `{code_col}`, DESCRIPTION: `{desc_col}`, PRICE INCL: `{price_col}`")
+
+                # Build matched DF
+                matched_df = build_matched_df(
+                    price_df, uploaded_photos, code_col, desc_col, price_col
+                )
+
+                # Display summary table (no FILE col)
+                display_df = matched_df[["FILENAME", "CODE", "DESCRIPTION", "PRICE_INCL"]].copy()
+                display_df["PRICE_INCL"] = display_df["PRICE_INCL"].astype(str)
+                st.markdown("### ✅ Matched Items Preview")
+                st.dataframe(display_df, use_container_width=True)
+
+                # Build Excel + PDF using temp dir
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    excel_bytes = build_excel_with_thumbnails(matched_df, tmpdir)
+                    pdf_bytes = build_pdf_grid(matched_df, tmpdir)
+
+                st.markdown("### 📥 Downloads")
+
+                st.download_button(
+                    "⬇️ Download Excel with Thumbnails",
+                    data=excel_bytes,
+                    file_name="catalogue_with_photos.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                )
+
+                st.download_button(
+                    "⬇️ Download 3×3 PDF Catalogue",
+                    data=pdf_bytes,
+                    file_name="photo_catalogue.pdf",
+                    mime="application/pdf",
+                )
+
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
+
+else:
+    st.info("Please upload **photos** and a **price Excel file** to continue.")
