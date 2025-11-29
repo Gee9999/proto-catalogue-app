@@ -4,200 +4,230 @@ import tempfile
 import os
 from fpdf import FPDF
 from PIL import Image
-from openpyxl import Workbook
-from openpyxl.drawing.image import Image as XLImage
 
-st.set_page_config(page_title="Photo Catalogue Builder", layout="wide")
-
-# -----------------------------
-# Extract numeric code from filename
-# -----------------------------
+# ---------------------------------------------
+# Extract numeric code from photo filename
+# ---------------------------------------------
 def extract_code_from_filename(filename):
-    digits = "".join(c for c in filename if c.isdigit())
-    return digits[:10]  # Your codes are always first 10 digits
+    num = ''.join(c for c in filename if c.isdigit())
+    return num[:10] if len(num) >= 6 else None
 
-# -----------------------------
-# Find closest code match (exact or nearest)
-# -----------------------------
-def get_best_match(code_str, code_dict):
-    if code_str in code_dict:
-        return code_str
-    
-    # fallback – closest numeric distance
-    try:
-        target = int(code_str)
-        best = None
-        best_diff = 999999999
-        for k in code_dict:
-            diff = abs(int(k) - target)
-            if diff < best_diff:
-                best_diff = diff
-                best = k
-        return best
-    except:
-        return None
 
-# -----------------------------
-# Match photos with price Excel
-# -----------------------------
-def match_photos_to_prices(photo_files, price_df):
-    price_df["CODE_STR"] = price_df["CODE"].astype(str).str.extract(r"(\d+)")
-    price_df["CODE_STR"] = price_df["CODE_STR"].str[:10]
+# ---------------------------------------------
+# Clean and prepare price Excel file
+# ---------------------------------------------
+def load_price_file(uploaded_file):
 
-    # Make index unique by grouping duplicates and taking first
-    price_df = price_df.groupby("CODE_STR", as_index=False).first()
+    df = pd.read_excel(uploaded_file, dtype=str)
 
-    code_dict = price_df.set_index("CODE_STR")[["CODE", "DESCRIPTION", "PRICE_A_INCL"]].to_dict("index")
+    df.columns = [c.strip().upper() for c in df.columns]
 
-    results = []
+    # Must contain CODE + DESCRIPTION + PRICE-AINCL.
+    required = ["CODE", "DESCRIPTION"]
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Excel must contain column '{col}'")
 
-    for file in photo_files:
-        filename = file.name
-        extracted = extract_code_from_filename(filename)
-        best = get_best_match(extracted, code_dict)
+    # Detect price column
+    price_cols = [c for c in df.columns if "AINCL" in c.replace(" ", "")]
+    if not price_cols:
+        raise ValueError("Could not find price column (PRICE-AINCL.)")
+    price_col = price_cols[0]
 
-        if best:
-            row = code_dict[best]
-            results.append({
-                "PHOTO_FILE": filename,
-                "CODE": row["CODE"],
-                "DESCRIPTION": row["DESCRIPTION"],
-                "PRICE_A_INCL": row["PRICE_A_INCL"]
+    df["PRICE_AINCL"] = df[price_col].astype(str)
+
+    # Standardize CODE formatting (remove decimals etc.)
+    df["CODE_STR"] = df["CODE"].astype(str).str.replace(".0", "", regex=False).str.strip()
+
+    return df[["CODE_STR", "CODE", "DESCRIPTION", "PRICE_AINCL"]]
+
+
+# ---------------------------------------------
+# Best prefix-based code matching
+# ---------------------------------------------
+def best_match(photo_code, df):
+    exact = df[df["CODE_STR"] == photo_code]
+    if not exact.empty:
+        return exact.iloc[0]
+
+    # Prefix match (photo code starts with real code)
+    df["LEN"] = df["CODE_STR"].str.len()
+    subset = df[df["CODE_STR"].apply(lambda x: photo_code.startswith(x))]
+    if not subset.empty:
+        return subset.sort_values("LEN", ascending=False).iloc[0]
+
+    return None
+
+
+# ---------------------------------------------
+# Match photos to price Excel rows
+# ---------------------------------------------
+def match_photos(photo_files, df):
+    matched_rows = []
+
+    for p in photo_files:
+        code = extract_code_from_filename(p.name)
+        if not code:
+            continue
+
+        row = best_match(code, df)
+        if row is None:
+            matched_rows.append({
+                "PHOTO_FILE": p.name,
+                "CODE": code,
+                "DESCRIPTION": "NOT FOUND",
+                "PRICE_AINCL": "N/A"
             })
         else:
-            results.append({
-                "PHOTO_FILE": filename,
-                "CODE": "NOT FOUND",
-                "DESCRIPTION": "",
-                "PRICE_A_INCL": ""
+            matched_rows.append({
+                "PHOTO_FILE": p.name,
+                "CODE": row["CODE_STR"],
+                "DESCRIPTION": row["DESCRIPTION"],
+                "PRICE_AINCL": row["PRICE_AINCL"]
             })
 
-    return pd.DataFrame(results)
+    return pd.DataFrame(matched_rows)
 
-# -----------------------------
-# Build PDF (already perfect)
-# -----------------------------
-def build_pdf(df, temp_dir):
-    pdf = FPDF("P", "mm", "A4")
+
+# ---------------------------------------------
+# Build PDF (3×3 layout, perfect spacing)
+# ---------------------------------------------
+def build_pdf(df, temp_dir, thumb_size=120):
+
+    class PDF(FPDF):
+        pass
+
+    pdf = PDF()
+    pdf.set_auto_page_break(auto=True, margin=10)
     pdf.add_page()
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, "Photo Catalogue", ln=1, align="C")
 
-    pdf.set_font("Arial", size=10)
+    cols = 3
+    cell_w = 65
+    cell_h = 65
 
-    cell_w = 90
-    cell_h = 70
     x_start = 10
-    y_start = 30
+    y_start = 20
+    x = x_start
+    y = y_start
 
-    col = 0
-    row_y = y_start
+    count = 0
 
-    for i, r in df.iterrows():
-        if col == 2:
-            col = 0
-            row_y += cell_h + 20
-        if row_y > 260:
+    for _, row in df.iterrows():
+        img_path = os.path.join(temp_dir, "_tmp_" + row["PHOTO_FILE"])
+
+        # Process thumbnail
+        try:
+            img = Image.open(os.path.join(temp_dir, row["PHOTO_FILE"]))
+            img.thumbnail((thumb_size, thumb_size))
+            img.save(img_path)
+        except:
+            continue
+
+        # Draw image
+        pdf.image(img_path, x=x, y=y, w=cell_w)
+
+        # Move text UNDER the image
+        text_y = y + thumb_size + 2
+        pdf.set_xy(x, text_y)
+        pdf.set_font("Arial", size=8)
+
+        pdf.multi_cell(cell_w, 4, f"{row['CODE']}\n{row['DESCRIPTION']}\nR {row['PRICE_AINCL']}", 0, "L")
+
+        count += 1
+        x += cell_w + 5
+
+        # New row
+        if count % cols == 0:
+            x = x_start
+            y += thumb_size + 18
+
+        # New page
+        if y > 240:
             pdf.add_page()
-            row_y = y_start
-            col = 0
-
-        x = x_start + col * (cell_w + 10)
-
-        # Save image to temp
-        img_path = os.path.join(temp_dir, f"img_{i}.jpg")
-        with open(img_path, "wb") as f:
-            f.write(r["FILE_BYTES"])
-
-        # Photo
-        pdf.image(img_path, x=x, y=row_y, w=60)
-
-        # Text ALWAYS below image
-        pdf.set_xy(x, row_y + 62)
-        pdf.multi_cell(60, 5, f"{r['CODE']}\n{r['DESCRIPTION']}\nR {r['PRICE_A_INCL']}", align="L")
-
-        col += 1
+            x = x_start
+            y = y_start
 
     return pdf.output(dest="S").encode("latin1")
 
-# -----------------------------
-# Build Excel with thumbnails
-# -----------------------------
-def build_excel_with_thumbs(df, temp_dir):
+
+# ---------------------------------------------
+# Build Excel with thumbnails (120×120)
+# ---------------------------------------------
+def build_excel(df, temp_dir, thumb_size=120):
+    from openpyxl import Workbook
+    from openpyxl.drawing.image import Image as XLImage
+
     wb = Workbook()
     ws = wb.active
 
-    ws.append(["PHOTO", "CODE", "DESCRIPTION", "PRICE_A INCL"])
+    ws.append(["PHOTO", "CODE", "DESCRIPTION", "PRICE_AINCL"])
 
-    row_idx = 2
+    for idx, row in df.iterrows():
+        ws.append(["", row["CODE"], row["DESCRIPTION"], row["PRICE_AINCL"]])
 
-    for _, r in df.iterrows():
-        temp_img = os.path.join(temp_dir, f"thumb_{row_idx}.jpg")
+        img_path = os.path.join(temp_dir, row["PHOTO_FILE"])
+        thumb_path = img_path + "_xl.jpg"
 
-        # Create 120×120 thumbnail
-        img = Image.open(r["TEMP_FILE"])
-        img.thumbnail((120, 120))
-        img.save(temp_img)
+        try:
+            img = Image.open(img_path)
+            img.thumbnail((thumb_size, thumb_size))
+            img.save(thumb_path)
 
-        # Insert thumbnail
-        xl_img = XLImage(temp_img)
-        xl_img.width = 120
-        xl_img.height = 120
-        ws.row_dimensions[row_idx].height = 100
-        ws.add_image(xl_img, f"A{row_idx}")
+            xl_img = XLImage(thumb_path)
+            xl_img.width = thumb_size
+            xl_img.height = thumb_size
 
-        # Add text
-        ws[f"B{row_idx}"] = r["CODE"]
-        ws[f"C{row_idx}"] = r["DESCRIPTION"]
-        ws[f"D{row_idx}"] = r["PRICE_A_INCL"]
+            ws.add_image(xl_img, f"A{idx+2}")
 
-        row_idx += 1
+            ws.row_dimensions[idx+2].height = thumb_size * 0.75
 
-    out_path = os.path.join(temp_dir, "catalogue.xlsx")
-    wb.save(out_path)
-    return out_path
+        except:
+            pass
 
-# -----------------------------
-# STREAMLIT APP UI
-# -----------------------------
+    out = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    wb.save(out.name)
+    out.seek(0)
+    return out.read()
+
+
+# ---------------------------------------------
+# Streamlit App
+# ---------------------------------------------
 def main():
-    st.title("Photo Catalogue Builder")
-    st.write("Upload Excel (with CODE, DESCRIPTION, PRICE_A_INCL) and product photos.")
 
-    price_file = st.file_uploader("Upload Excel price file", type=["xls", "xlsx"])
-    photo_files = st.file_uploader("Upload product photos", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+    st.title("📸 Photo Catalogue Builder")
 
-    if price_file and photo_files:
-        if st.button("Generate Catalogue"):
-            with tempfile.TemporaryDirectory() as temp_dir:
+    st.write("Upload price Excel + photos → get PDF + Excel")
 
-                # Load price file
-                price_df = pd.read_excel(price_file)
-                price_df.columns = [c.upper().replace(" ", "_") for c in price_df.columns]
+    price_file = st.file_uploader("Upload price Excel", type=["xlsx", "xls"])
+    photos = st.file_uploader("Upload product photos", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 
-                df = match_photos_to_prices(photo_files, price_df)
+    if not price_file or not photos:
+        return
 
-                # Save original uploaded bytes for PDF
-                file_bytes_list = []
-                temp_paths = []
+    # Load price sheet
+    df_price = load_price_file(price_file)
 
-                for i, f in enumerate(photo_files):
-                    b = f.read()
-                    file_bytes_list.append(b)
-                    path = os.path.join(temp_dir, f"orig_{i}.jpg")
-                    with open(path, "wb") as out:
-                        out.write(b)
-                    temp_paths.append(path)
+    # Temp directory
+    with tempfile.TemporaryDirectory() as temp_dir:
 
-                df["FILE_BYTES"] = file_bytes_list
-                df["TEMP_FILE"] = temp_paths
+        # Save photos
+        for p in photos:
+            with open(os.path.join(temp_dir, p.name), "wb") as f:
+                f.write(p.getbuffer())
 
-                pdf_bytes = build_pdf(df, temp_dir)
-                excel_path = build_excel_with_thumbs(df, temp_dir)
+        # Match photos to price Excel
+        df_match = match_photos(photos, df_price)
 
-                st.success("Catalogue generated successfully!")
+        # PDF & Excel
+        pdf_bytes = build_pdf(df_match, temp_dir, thumb_size=120)
+        excel_bytes = build_excel(df_match, temp_dir, thumb_size=120)
 
-                st.download_button("Download PDF", data=pdf_bytes, file_name="catalogue.pdf")
-                st.download_button("Download Excel", data=open(excel_path, "rb").read(), file_name="catalogue.xlsx")
+        st.success("Done! Download your files:")
 
-main()
+        st.download_button("📄 Download PDF", data=pdf_bytes, file_name="catalogue.pdf")
+        st.download_button("📊 Download Excel", data=excel_bytes, file_name="catalogue.xlsx")
+
+
+if __name__ == "__main__":
+    main()
